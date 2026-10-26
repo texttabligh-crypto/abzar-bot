@@ -1,49 +1,68 @@
-# Trading Bot V1
+# Abzar Bot (V2.4)
 
-ربات مدیریت کاتالوگ، قیمت و سفارش برای شرکت بازرگانی.
+ربات تلگرامی مدیریت کاتالوگ، قیمت، سفارش و کانال برای شرکت بازرگانی.
 
-## امکانات V1
-- Owner / Admin / Customer foundation
-- Product / Brand / Category / Supplier
-- Internal SKU
-- Price history
-- Tier pricing data model
-- Cart + Order + immutable order price snapshots
-- Payment receipt data model
-- Permission + Audit Log data model
-- Excel smart header detection
-- Excel Dry Run
-- Supplier mapping model
-- Excel price list export
-- PostgreSQL + Redis + Docker Compose
+## امکانات
 
-## نصب روی سرور
+**مشتری**
+- ثبت‌نام تفکیک‌شده: **خرید خرد** (فقط شماره تماس) و **خرید عمده** (فروشگاهی، با تأیید مدیریت)
+- مرور درختی دسته‌بندی‌ها (دسته → زیرمجموعه → محصول)، برندها، جستجو با کد/نام/مدل
+- قیمت خرده برای مشتری خرد؛ قیمت عمده + خرده + مزایای پلکانی برای مشتری عمده
+- سبد خرید، ثبت سفارش، ارسال فیش، پیگیری وضعیت، لیست قیمت Excel/PDF
+
+**مدیریت**
+- محصول: ساخت با عکس چندگانه، برند، دسته، سه قیمت و قیمت پلکانی
+- ویرایش قیمت‌ها پشت سر هم (پایه → خرده → عمده → پلکان)
+- افزایش/کاهش درصدی روی هر سه قیمت، برای یک محصول، یک دسته یا همه
+- دسته‌بندی درختی با افزودن زیرمجموعه و محصول در همان دسته
+- Import اکسل با Dry-Run، تشخیص سرستون و انتخاب نوع قیمت
+- اتصال به کانال با بررسی ادمین بودن ربات، انتشار خودکار محصول جدید و **فوتر قابل ویرایش**
+- تأیید فیش پرداخت، مدیریت سفارش‌ها، کاربران و درخواست‌های حساب عمده
+- مدیران با لینک دعوت یک‌بارمصرف و مجوزهای دقیق، لاگ فعالیت و گزارش‌ها
+
+## راه‌اندازی
 
 ```bash
-cd /opt
-unzip trading-bot-v1.zip -d trading-bot-v1
-cd trading-bot-v1
 cp .env.example .env
-```
-
-پسورد تصادفی:
-```bash
-openssl rand -hex 24
-```
-
-فایل `.env` را ویرایش کنید و موارد زیر را پر کنید:
-- TELEGRAM_BOT_TOKEN
-- OWNER_TELEGRAM_ID
-- POSTGRES_PASSWORD
-- DATABASE_URL
-- اطلاعات کارت در صورت نیاز
-
-سپس:
-```bash
+# TELEGRAM_BOT_TOKEN و OWNER_TELEGRAM_ID و POSTGRES_PASSWORD و DATABASE_URL را پر کنید
 docker compose build
 docker compose up -d
 docker compose logs -f bot
 ```
 
-## نکته
-این نسخه هسته V1 قابل اجراست و ساختار همه قابلیت‌های اصلی را دارد. بخش‌هایی مثل UI کامل ویرایش محصول، تأیید فیش با دکمه‌های چندمدیره و Import نهایی پس از Dry Run در همین معماری قابل تکمیل هستند.
+پسورد تصادفی:
+
+```bash
+openssl rand -hex 24
+```
+
+سپس در تلگرام به ربات `/start` بدهید؛ چون آیدی شما در `OWNER_TELEGRAM_ID` است، پنل مدیریت فعال می‌شود.
+
+## استقرار نسخه جدید
+
+```bash
+git pull            # یا فایل‌های جدید را روی سرور کپی کنید
+./deploy.sh         # بکاپ دیتابیس + build بدون کش + restart
+```
+
+سپس در تلگرام:
+
+```
+/version    ← باید «نسخه 2.4.0» و فهرست قابلیت‌ها را نشان دهد
+/admin      ← منوی تازه را باز کنید
+```
+
+> دکمه‌های منوی قدیمی در چت باقی می‌مانند؛ اگر روی آن‌ها بزنید پیام «این دکمه از منوی قبلی است» می‌گیرید.
+
+## تست
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt pytest pytest-asyncio aiosqlite
+.venv/bin/python -m pytest tests/ -q
+```
+
+## مستندات
+
+- `DELIVERY.md` — خلاصه‌ی تغییرات نسخه V2.4 و راهنمای هر قابلیت
+- `PROJECT_REVIEW.md` — بررسی کامل معماری، یافته‌ها و نقشه راه

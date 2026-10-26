@@ -11,6 +11,7 @@ from app.bot.routers.customer import router as customer_router
 from app.bot.routers.payments import router as payments_router
 from app.bot.routers.admin import router as admin_router
 from app.bot.routers.imports import router as import_router
+from app.bot.routers.fallback import router as fallback_router
 
 PERMS = [
     ("products.view","مشاهده محصولات"),
@@ -27,7 +28,7 @@ PERMS = [
     ("reports.view","گزارش‌ها"),
     ("settings.manage","تنظیمات"),
     ("channel.publish","ارسال به کانال"),
-    ("channel.manage","مدیریت کانال"),
+    ("channel.manage","اتصال و مدیریت کانال"),
 ]
 
 async def seed_defaults():
@@ -70,6 +71,9 @@ async def seed_defaults():
             "support_text": "برای پشتیبانی با مدیریت شرکت تماس بگیرید.",
             "company_contact": "",
             "notify_price_changes": "0",
+            # V2.4
+            "channel_footer": "",
+            "auto_publish_new_products": "1",
         }
         for key, value in defaults.items():
             if not await session.get(SystemSetting, key):
@@ -121,3 +125,5 @@ def register_routers(dp: Dispatcher):
     dp.include_router(import_router)
     dp.include_router(customer_router)
     dp.include_router(payments_router)
+    # همیشه آخر: پاسخ دادن به دکمه‌های قدیمی و پیام‌های بی‌صاحب
+    dp.include_router(fallback_router)
