@@ -20,7 +20,7 @@ from app.bot.keyboards import (
 from app.services.auth import has_permission, guard
 from app.services.catalog import (
     next_sku, set_price, set_product_price, PRICE_LABELS, PRICE_ATTRS,
-    category_tree, category_label, category_path, WHOLESALE,
+    category_tree, category_label, category_path, descendant_ids, WHOLESALE,
 )
 from app.services.audit import add_audit
 from app.utils import normalize_digits, fa_num, order_status_label, parse_int
@@ -583,6 +583,8 @@ async def edit_select(cb: CallbackQuery, state: FSMContext):
             InlineKeyboardButton(text="توضیحات", callback_data="editp:field:description"),
             InlineKeyboardButton(text="عکس اصلی", callback_data="editp:field:photo"),
         ],
+        [InlineKeyboardButton(text="دسته‌بندی", callback_data="editmeta:category"),
+         InlineKeyboardButton(text="برند", callback_data="editmeta:brand")],
         [InlineKeyboardButton(text="فعال/غیرفعال", callback_data="editp:toggle")],
     ])
     await cb.message.answer(
@@ -2226,7 +2228,7 @@ async def price_change_category_pick(cb: CallbackQuery, state: FSMContext):
     cid = int(cb.data.split(":")[2])
     async with SessionLocal() as session:
         ids = (await session.execute(select(Product.id).where(
-            Product.is_active.is_(True), Product.category_id == cid
+            Product.is_active.is_(True), Product.category_id.in_(await descendant_ids(session, cid))
         ))).scalars().all()
     if not ids:
         return await cb.answer("در این دسته محصول فعالی نیست.", show_alert=True)
@@ -3343,3 +3345,41 @@ async def bank_edit_save(message: Message, state: FSMContext):
         await session.commit()
     await state.clear()
     await message.answer("✅ حساب ویرایش شد.")
+
+
+@router.callback_query(F.data.in_({"editmeta:category", "editmeta:brand"}))
+@guard("products.edit")
+async def edit_metadata_menu(cb: CallbackQuery, state: FSMContext):
+    kind = cb.data.split(":")[1]
+    async with SessionLocal() as session:
+        if kind == "category":
+            options = [(c.id, category_label(c.name, depth)) for c, depth in await category_tree(session, only_active=True)]
+        else:
+            options = [(b.id, b.name) for b in (await session.execute(select(Brand).where(Brand.is_active.is_(True)))).scalars()]
+    rows = [[InlineKeyboardButton(text=name, callback_data=f"editmeta:set:{kind}:{oid}")] for oid, name in options[:80]]
+    rows.append([InlineKeyboardButton(text="بدون انتخاب", callback_data=f"editmeta:set:{kind}:0")])
+    await cb.message.answer("گزینه جدید را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("editmeta:set:"))
+@guard("products.edit")
+async def edit_metadata_save(cb: CallbackQuery, state: FSMContext):
+    _, _, kind, raw_id = cb.data.split(":")
+    if kind not in {"category", "brand"}:
+        return await cb.answer("درخواست نامعتبر است.", show_alert=True)
+    data = await state.get_data()
+    async with SessionLocal() as session:
+        product = await session.get(Product, data.get("product_id")) if data.get("product_id") else None
+        if not product:
+            return await cb.answer("دوباره محصول را برای ویرایش انتخاب کنید.", show_alert=True)
+        oid = int(raw_id)
+        entity = await session.get(Category if kind == "category" else Brand, oid) if oid else None
+        if oid and (not entity or not entity.is_active):
+            return await cb.answer("گزینه فعال نیست.", show_alert=True)
+        setattr(product, f"{kind}_id", oid or None)
+        await session.commit()
+        pid = product.id
+    await sync_product_post(cb.bot, pid)
+    await cb.message.answer("✅ تغییر ذخیره شد.")
+    await cb.answer()

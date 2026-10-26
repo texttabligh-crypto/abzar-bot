@@ -2,6 +2,8 @@ name: Deploy Abzar Bot
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       operation:
@@ -12,10 +14,31 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: abzar-production
+  group: abzar-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
   cancel-in-progress: false
 jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Persian PDF font
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run regression tests
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./tests/test.db
+          POSTGRES_PASSWORD: test
+          TELEGRAM_BOT_TOKEN: '123:TEST'
+          OWNER_TELEGRAM_ID: ''
+          REDIS_URL: redis://localhost:6379/15
+        run: python -m pytest tests/ -q
   deploy:
+    needs: tests
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20

@@ -124,14 +124,19 @@ async def receive_receipt(message: Message):
     await register_receipt(message, order.id, file_id)
 
 
-async def register_receipt(message: Message, order_id: int, file_id: str):
+async def register_receipt(message: Message, order_id: int, file_id: str, *, customer_tg_id: int | None = None):
     async with SessionLocal() as session:
-        user = await get_user(session, message.from_user.id)
-        order = await session.get(Order, order_id)
+        user = await get_user(session, customer_tg_id if customer_tg_id is not None else message.from_user.id)
+        order = await session.scalar(select(Order).where(Order.id == order_id).with_for_update())
+        if not user or not user.is_active or (customer_type_of(user) == WHOLESALE and not user.is_approved):
+            await message.answer("حساب شما مجاز نیست.")
+            return False
         if not order or order.user_id != user.id:
-            return await message.answer("سفارش پیدا نشد.")
+            await message.answer("سفارش پیدا نشد.")
+            return False
         if order.status != "WAITING_PAYMENT":
-            return await message.answer("این سفارش دیگر در انتظار پرداخت نیست.")
+            await message.answer("این سفارش دیگر در انتظار پرداخت نیست.")
+            return False
 
         payment = Payment(order_id=order.id, receipt_file_id=file_id, status="PENDING")
         session.add(payment)
@@ -146,7 +151,9 @@ async def register_receipt(message: Message, order_id: int, file_id: str):
         recipients = await approver_telegram_ids(session)
         order_no = order.order_no
         total = order.total_amount
-        customer = order.customer_name_snapshot or message.from_user.full_name
+        customer = order.customer_name_snapshot or " ".join(
+            part for part in (user.first_name, user.last_name) if part
+        ) or "-"
         shop = order.shop_name_snapshot or "-"
 
     await message.answer("✅ فیش دریافت شد و برای بررسی مدیریت ارسال شد.")
@@ -164,6 +171,7 @@ async def register_receipt(message: Message, order_id: int, file_id: str):
         except Exception:
             pass
 
+    return True
 
 @router.callback_query(F.data.startswith("payorder:"))
 async def choose_receipt_order(cb: CallbackQuery):
@@ -177,8 +185,10 @@ async def choose_receipt_order(cb: CallbackQuery):
     if not file_id:
         await cb.answer("مدت انتخاب سفارش گذشته است. تصویر فیش را دوباره ارسال کنید.", show_alert=True)
         return
+    if not await register_receipt(cb.message, order_id, file_id, customer_tg_id=cb.from_user.id):
+        await cb.answer("فیش ثبت نشد؛ پیام را بررسی کنید.", show_alert=True)
+        return
     await redis_client.delete(f"receipt:{cb.from_user.id}")
-    await register_receipt(cb.message, order_id, file_id)
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
