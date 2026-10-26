@@ -19,6 +19,11 @@ class User(Base):
     phone: Mapped[str | None] = mapped_column(String(30))
     shop_name: Mapped[str | None] = mapped_column(String(200))
     city: Mapped[str | None] = mapped_column(String(100))
+    # Customer segment: "retail" (خرد) or "wholesale" (عمده).
+    # Wholesale accounts need management approval before they can buy.
+    customer_type: Mapped[str] = mapped_column(String(20), default="retail", index=True)
+    address: Mapped[str | None] = mapped_column(Text)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_approved: Mapped[bool] = mapped_column(Boolean, default=True)
     is_owner: Mapped[bool] = mapped_column(Boolean, default=False)

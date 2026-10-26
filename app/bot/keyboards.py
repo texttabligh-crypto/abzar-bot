@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
-def main_menu(is_admin=False):
+def main_menu(is_admin=False, customer_type="retail"):
     rows = [
         [
             InlineKeyboardButton(text="🛍 محصولات", callback_data="menu:products"),
@@ -41,7 +41,7 @@ def admin_menu(allowed_codes=None, is_owner=False):
         ("🏭 تأمین‌کننده‌ها", "admin:suppliers", ("products.edit",)),
         ("📥 ورود Excel", "admin:excel", ("excel.import",)),
         ("📣 ارسال به کانال", "admin:publish", ("channel.publish",)),
-        ("📡 تنظیمات کانال", "admin:channel_settings", ("channel.manage",)),
+        ("📡 اتصال به کانال", "admin:channel_settings", ("channel.manage",)),
         ("🧾 سفارش‌ها", "admin:orders", ("orders.view", "orders.manage")),
         ("💳 فیش‌های پرداخت", "admin:payments", ("payments.view", "payments.approve")),
         ("👥 کاربران", "admin:users", ("users.manage",)),
@@ -65,6 +65,12 @@ def request_phone_keyboard():
         one_time_keyboard=True,
     )
 
+def customer_type_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 خرید خرد", callback_data="ctype:retail")],
+        [InlineKeyboardButton(text="📦 خرید عمده (فروشگاهی)", callback_data="ctype:wholesale")],
+    ])
+
 def price_list_formats():
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📗 Excel", callback_data="pricefmt:xlsx"),
@@ -87,7 +93,8 @@ def channel_settings_menu(channels):
             text=f"{'✅' if c.is_active else '⭕'} {c.title} | {c.chat_ref}",
             callback_data=f"channel:toggle:{c.id}",
         )])
-    rows.append([InlineKeyboardButton(text="➕ افزودن کانال", callback_data="channel:add")])
+    rows.append([InlineKeyboardButton(text="➕ اتصال / تغییر کانال", callback_data="channel:add")])
+    rows.append([InlineKeyboardButton(text="✏️ ویرایش فوتر پیام‌های کانال", callback_data="channel:footer")])
     rows.append([InlineKeyboardButton(text="⬅️ مدیریت", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -102,8 +109,12 @@ def brand_picker(brands, prefix="addpbrand"):
     rows.append([InlineKeyboardButton(text="⬅️ بدون برند", callback_data=f"{prefix}:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def category_picker(categories, prefix="addpcat"):
-    rows = [[InlineKeyboardButton(text=c.name, callback_data=f"{prefix}:{c.id}")] for c in categories]
+def category_picker(tree_rows, prefix="addpcat"):
+    """tree_rows: [(category, depth), ...] flattened tree."""
+    rows = []
+    for cat, depth in tree_rows:
+        label = ("└ " * depth if depth else "") + cat.name
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"{prefix}:{cat.id}")])
     rows.append([InlineKeyboardButton(text="⬅️ بدون دسته‌بندی", callback_data=f"{prefix}:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -182,4 +193,10 @@ def order_status_menu(order_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=title, callback_data=f"orderstatus:{order_id}:{code}")]
         for code, title in statuses
+    ])
+
+def wholesale_review_keyboard(user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ تأیید حساب عمده", callback_data=f"wsapprove:{user_id}")],
+        [InlineKeyboardButton(text="❌ رد درخواست", callback_data=f"wsreject:{user_id}")],
     ])

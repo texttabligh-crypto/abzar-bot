@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from io import BytesIO
 from datetime import datetime
-from pathlib import Path
 
 from openpyxl import Workbook
 from reportlab.lib import colors
@@ -19,6 +18,7 @@ from bidi.algorithm import get_display
 
 from app.models import Product, Brand, ProductChannelPost, SystemSetting
 from app.core.config import settings
+from app.utils import stock_label
 
 
 def rtl(text) -> str:
@@ -45,7 +45,7 @@ async def _rows(session):
             "price": int(p.base_price or 0),
             "wholesale_price": int(p.wholesale_price or 0),
             "unit": p.unit,
-            "stock": p.stock_status,
+            "stock": stock_label(p.stock_status),
             "url": post.post_url if post else "",
         })
     return out

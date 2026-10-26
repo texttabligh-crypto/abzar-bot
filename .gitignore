@@ -17,3 +17,7 @@ venv/
 *.tar.gz
 backup/
 backups/
+
+# test artifacts
+tests/*.db
+.pytest_cache/

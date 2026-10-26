@@ -1,6 +1,6 @@
 import os, tempfile, json
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, date
 
 from aiogram import Router, F
 from aiogram.fsm.state import StatesGroup, State
@@ -15,8 +15,8 @@ from app.models import (
     User, Supplier, Product, SupplierProduct, ImportBatch, ImportRow,
     Brand, SupplierMapping, SystemSetting
 )
-from app.services.auth import has_permission
-from app.services.catalog import next_sku, set_price
+from app.services.auth import has_permission, guard
+from app.services.catalog import next_sku, set_product_price
 from app.services.excel_import import parse_workbook
 from app.bot.keyboards import confirm_import
 from app.utils import norm_text, normalize_digits
@@ -26,13 +26,75 @@ router = Router()
 class ImportFlow(StatesGroup):
     file = State()
 
+MONEY_NOISE = ("تومان", "ریال", "ت", " IRR", " IRT")
+
+
 def price_value(v):
+    """قیمت را از سلول اکسل بخوان؛ «۱٬۲۰۰٬۰۰۰ تومان» و ممیز اعشاری هم پذیرفته می‌شود."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float, Decimal)):
+        try:
+            return Decimal(str(v)).quantize(Decimal("1"))
+        except Exception:
+            return None
+    text = normalize_digits(str(v)).strip()
+    for noise in MONEY_NOISE:
+        text = text.replace(noise, "")
+    text = text.replace(",", "").replace("٬", "").replace(" ", "").strip()
+    if not text:
+        return None
     try:
-        return Decimal(normalize_digits(str(v or "")).replace(",","").replace("٬",""))
+        return Decimal(text).quantize(Decimal("1"))
     except Exception:
         return None
 
-async def classify_rows(session, rows, supplier_id):
+
+def json_safe(row: dict) -> dict:
+    """مقادیر سلول (تاریخ/عدد) باید قابل ذخیره در ستون JSON باشند."""
+    out = {}
+    for key, value in (row or {}).items():
+        if isinstance(value, (datetime, date)):
+            out[key] = value.isoformat()
+        elif isinstance(value, Decimal):
+            out[key] = str(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value
+        else:
+            out[key] = str(value)
+    return out
+
+
+FIELD_LABELS = {
+    "name": "نام کالا",
+    "price": "قیمت",
+    "sku": "کد کالا",
+    "brand": "برند",
+}
+
+
+def mapping_label(mapping: dict) -> str:
+    return "، ".join(f"{FIELD_LABELS.get(k, k)} → ستون {v}" for k, v in mapping.items()) or "—"
+
+PRICE_TYPE_LABELS = {
+    "purchase": "قیمت خرید / پایه",
+    "retail": "قیمت فروش خرده",
+    "wholesale": "قیمت فروش عمده",
+}
+
+PRICE_TYPE_ATTR = {
+    "purchase": "purchase_price",
+    "retail": "base_price",
+    "wholesale": "wholesale_price",
+}
+
+
+def classify_rows(session, rows, supplier_id, price_type="purchase"):
+    attr = PRICE_TYPE_ATTR.get(price_type, "purchase")
+    return _classify_rows(session, rows, supplier_id, attr)
+
+
+async def _classify_rows(session, rows, supplier_id, attr="purchase_price"):
     products = (await session.execute(select(Product))).scalars().all()
     seen = set()
     result = []
@@ -54,13 +116,13 @@ async def classify_rows(session, rows, supplier_id):
             sp = await session.scalar(select(SupplierProduct).where(SupplierProduct.supplier_id==supplier_id, SupplierProduct.supplier_sku==sku))
             if sp:
                 product = await session.get(Product, sp.product_id)
-                status = "PRICE_CHANGED" if Decimal(product.base_price or 0) != price else "MATCH"
+                status = "PRICE_CHANGED" if Decimal(getattr(product, attr) or 0) != price else "MATCH"
                 result.append({"row_number":idx,"status":status,"row":row,"product_id":product.id,"confidence":100,"note":"Supplier SKU"})
                 continue
 
         exact = next((p for p in products if norm_text(p.name)==norm_text(name)), None)
         if exact:
-            status = "PRICE_CHANGED" if Decimal(exact.base_price or 0) != price else "MATCH"
+            status = "PRICE_CHANGED" if Decimal(getattr(exact, attr) or 0) != price else "MATCH"
             result.append({"row_number":idx,"status":status,"row":row,"product_id":exact.id,"confidence":100,"note":"نام دقیق"})
             continue
 
@@ -70,7 +132,7 @@ async def classify_rows(session, rows, supplier_id):
             if score > best_score:
                 best, best_score = p, score
         if best and best_score >= 94:
-            status = "PRICE_CHANGED" if Decimal(best.base_price or 0) != price else "MATCH"
+            status = "PRICE_CHANGED" if Decimal(getattr(best, attr) or 0) != price else "MATCH"
             result.append({"row_number":idx,"status":status,"row":row,"product_id":best.id,"confidence":best_score,"note":"شباهت بالا"})
         elif best and best_score >= 75:
             result.append({"row_number":idx,"status":"UNCERTAIN","row":row,"product_id":best.id,"confidence":best_score,"note":f"مشابه: {best.name}"})
@@ -90,11 +152,36 @@ async def import_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 @router.callback_query(F.data.startswith("import:supplier:"))
+@guard("excel.import")
 async def import_supplier(cb: CallbackQuery, state: FSMContext):
     sid = int(cb.data.split(":")[2])
     await state.update_data(supplier_id=sid or None)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{title}",
+            callback_data=f"import:pricetype:{code}",
+        )]
+        for code, title in PRICE_TYPE_LABELS.items()
+    ])
+    await cb.message.answer(
+        "قیمت‌های این فایل مربوط به کدام نوع قیمت محصول است؟\n\n"
+        "این انتخاب تعیین می‌کند قیمت‌های موجود کجا به‌روزرسانی شوند.",
+        reply_markup=kb,
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("import:pricetype:"))
+@guard("excel.import")
+async def import_price_type(cb: CallbackQuery, state: FSMContext):
+    code = cb.data.split(":")[2]
+    if code not in PRICE_TYPE_ATTR:
+        return await cb.answer("نوع قیمت نامعتبر است.", show_alert=True)
+    await state.update_data(price_type=code)
     await state.set_state(ImportFlow.file)
-    await cb.message.answer("فایل Excel با پسوند xlsx را ارسال کنید.")
+    await cb.message.answer(
+        f"✅ نوع قیمت: {PRICE_TYPE_LABELS[code]}\n\nفایل Excel با پسوند xlsx را ارسال کنید."
+    )
     await cb.answer()
 
 @router.message(ImportFlow.file, F.document)
@@ -109,11 +196,15 @@ async def import_file(message: Message, state: FSMContext):
         await message.bot.download(message.document, destination=path)
         report = parse_workbook(path)
         if "name" not in report["mapping"] or "price" not in report["mapping"]:
-            return await message.answer(f"ستون‌های نام/قیمت شناسایی نشد.\nMapping: {report['mapping']}")
+            return await message.answer(
+                "ستون‌های «نام» و «قیمت» در فایل شناسایی نشد؛ سرستون‌ها را بررسی کنید.\n"
+                f"تشخیص فعلی: {mapping_label(report['mapping'])}"
+            )
         data = await state.get_data()
+        price_type = data.get("price_type") or "purchase"
         async with SessionLocal() as session:
             actor = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
-            classified = await classify_rows(session, report["rows"], data.get("supplier_id"))
+            classified = await classify_rows(session, report["rows"], data.get("supplier_id"), price_type)
             counts = {}
             for x in classified:
                 counts[x["status"]] = counts.get(x["status"],0)+1
@@ -130,19 +221,27 @@ async def import_file(message: Message, state: FSMContext):
             for x in classified:
                 session.add(ImportRow(
                     batch_id=batch.id,row_number=x["row_number"],status=x["status"],
-                    raw_data=x["row"],matched_product_id=x["product_id"],confidence=x["confidence"],note=x["note"]
+                    raw_data=json_safe(x["row"]),matched_product_id=x["product_id"],
+                    confidence=x["confidence"],note=x["note"]
                 ))
             await session.commit()
             batch_id = batch.id
 
-        payload = {"batch_id":batch_id,"supplier_id":data.get("supplier_id"),"filename":message.document.file_name,"mapping":report["mapping"]}
+        payload = {
+            "batch_id": batch_id,
+            "supplier_id": data.get("supplier_id"),
+            "filename": message.document.file_name,
+            "mapping": report["mapping"],
+            "price_type": price_type,
+        }
         await redis_client.setex(f"import:{message.from_user.id}",3600,json.dumps(payload,ensure_ascii=False))
         text = (
             f"✅ فایل تحلیل شد\nتعداد ردیف: {len(report['rows'])}\n"
             f"New: {counts.get('NEW',0)}\nMatch: {counts.get('MATCH',0)}\n"
             f"Price Changed: {counts.get('PRICE_CHANGED',0)}\nUncertain: {counts.get('UNCERTAIN',0)}\n"
             f"Duplicate: {counts.get('DUPLICATE',0)}\nError: {counts.get('ERROR',0)}\n\n"
-            f"Mapping: {report['mapping']}"
+            f"تشخیص ستون‌ها: {mapping_label(report['mapping'])}\n"
+            f"نوع قیمت این فایل: {PRICE_TYPE_LABELS[price_type]}"
         )
         await message.answer(text, reply_markup=confirm_import(batch_id))
     finally:
@@ -150,6 +249,7 @@ async def import_file(message: Message, state: FSMContext):
             os.remove(path)
 
 @router.callback_query(F.data.startswith("import:review:"))
+@guard("excel.import")
 async def import_review(cb: CallbackQuery):
     batch_id = int(cb.data.split(":")[2])
     async with SessionLocal() as session:
@@ -171,6 +271,7 @@ async def import_review(cb: CallbackQuery):
     await cb.answer()
 
 @router.callback_query(F.data.startswith("uncertain:"))
+@guard("excel.import")
 async def uncertain_decision(cb: CallbackQuery):
     _, decision, rid = cb.data.split(":")
     async with SessionLocal() as session:
@@ -182,6 +283,7 @@ async def uncertain_decision(cb: CallbackQuery):
     await cb.answer("ثبت شد.")
 
 @router.callback_query(F.data == "import:cancel")
+@guard("excel.import")
 async def import_cancel(cb: CallbackQuery, state: FSMContext):
     await redis_client.delete(f"import:{cb.from_user.id}")
     await state.clear()
@@ -197,6 +299,7 @@ async def import_apply(cb: CallbackQuery, state: FSMContext):
         return await cb.answer("اطلاعات Import منقضی شده.", show_alert=True)
     payload = json.loads(raw)
     batch_id = payload["batch_id"]
+    price_type = payload.get("price_type") or "purchase"
     created = updated = skipped = 0
     changed_count = 0
     async with SessionLocal() as session:
@@ -220,8 +323,11 @@ async def import_apply(cb: CallbackQuery, state: FSMContext):
                 continue
             product = await session.get(Product, r.matched_product_id) if r.matched_product_id else None
             if product:
-                old = Decimal(product.base_price or 0)
-                await set_price(session, product, price, actor.id if actor else None, "excel")
+                attr = PRICE_TYPE_ATTR.get(price_type, "purchase_price")
+                old = Decimal(getattr(product, attr) or 0)
+                await set_product_price(
+                    session, product, price, actor.id if actor else None, "excel", price_type
+                )
                 updated += 1
                 if old != price:
                     changed_count += 1
@@ -234,10 +340,21 @@ async def import_apply(cb: CallbackQuery, state: FSMContext):
                         session.add(brand)
                         await session.flush()
                     brand_id = brand.id
+                values = {
+                    "purchase_price": Decimal("0"),
+                    "base_price": Decimal("0"),
+                    "wholesale_price": Decimal("0"),
+                }
+                values[PRICE_TYPE_ATTR.get(price_type, "purchase_price")] = price
+                # محصول جدید بدون قیمت فروش معنا ندارد؛ اگر فایل قیمت خرید بود،
+                # قیمت فروش را برابر آن می‌گذاریم تا از صفر بودن فروش جلوگیری شود.
+                if values["base_price"] == 0:
+                    values["base_price"] = price
+                if values["wholesale_price"] == 0:
+                    values["wholesale_price"] = values["base_price"]
                 product = Product(
                     internal_sku=await next_sku(session), name=name,
-                    purchase_price=price, base_price=price, wholesale_price=price,
-                    brand_id=brand_id
+                    brand_id=brand_id, **values
                 )
                 session.add(product)
                 await session.flush()
