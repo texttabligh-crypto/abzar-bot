@@ -38,7 +38,30 @@ openssl rand -hex 24
 
 سپس در تلگرام به ربات `/start` بدهید؛ چون آیدی شما در `OWNER_TELEGRAM_ID` است، پنل مدیریت فعال می‌شود.
 
-## استقرار نسخه جدید
+## نصب با یک دستور (پیشنهادی)
+
+روی سرور، در ترمینال (با کاربر root یا sudo):
+
+```bash
+cd /opt && curl -fsSL -o abzar.zip \
+  https://codeload.github.com/texttabligh-crypto/abzar-bot/zip/refs/heads/main \
+  && unzip -oq abzar.zip && bash abzar-bot-main/install.sh
+```
+
+نصب‌کننده خودش: بکاپ دیتابیس، دریافت آخرین کد، ساختن `.env` (با پرسیدن توکن و آیدی)،
+build بدون کش و ری‌استارت را انجام می‌دهد. اگر نصب قبلی وجود داشته باشد، `.env` و بکاپ‌ها
+دست نمی‌خورند.
+
+گزینه‌ها:
+
+```bash
+bash install.sh /opt/trading-bot-v1     # مسیر دلخواه
+bash install.sh --dry-run               # فقط نمایش مراحل، بدون تغییر
+```
+
+بعد از نصب در تلگرام `/version` بفرستید؛ باید «نسخه 2.4.0» و فهرست قابلیت‌ها را ببینید.
+
+## استقرار نسخه جدید (با گیت)
 
 ```bash
 git pull            # یا فایل‌های جدید را روی سرور کپی کنید

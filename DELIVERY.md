@@ -138,11 +138,21 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt pytest pytest-
 - اگر جواب داد «نسخه 2.4.0» + فهرست قابلیت‌ها → کد جدید نصب است.
 - اگر `/version` هیچ جوابی نداد → نسخه قدیمی روی سرور است (این دستور در V2.3 وجود ندارد).
 
-**گام ۲ — استقرار:**
+**گام ۲ — استقرار (یک دستور):**
 
 ```bash
-cd /opt/trading-bot-v1          # مسیر پروژه روی سرور
-git fetch origin && git merge origin/main   # یا فایل‌های جدید را کپی کنید
+cd /opt && curl -fsSL -o abzar.zip \
+  https://codeload.github.com/texttabligh-crypto/abzar-bot/zip/refs/heads/main \
+  && unzip -oq abzar.zip && bash abzar-bot-main/install.sh
+```
+
+اگر پروژه جای دیگری است، مسیر را بدهید: `bash install.sh /مسیر/پروژه`
+
+اجرای گیت‌محور هم ممکن است:
+
+```bash
+cd /opt/trading-bot-v1
+git fetch origin && git merge origin/main
 ./deploy.sh                     # بکاپ + build بدون کش + restart + لاگ
 ```
 
