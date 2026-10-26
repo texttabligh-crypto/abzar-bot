@@ -116,7 +116,8 @@ if [ "$DRY_RUN" != "1" ]; then
   fi
   SRC_DIR="$(find "$TMP_DIR/src" -maxdepth 1 -mindepth 1 -type d | head -1)"
   [ -d "$SRC_DIR/app" ] || fail "ساختار فایل دانلودشده درست نیست."
-  ok "کد دانلود شد: $(grep -m1 APP_VERSION "$SRC_DIR/app/version.py" | cut -d'"' -f2)"
+  [ -f "$SRC_DIR/app/version.py" ] || fail "کد دانلودشده نسخه جدید نیست (app/version.py ندارد). شاخه main را بررسی کنید."
+  ok "کد دانلود شد: نسخه $(grep -m1 APP_VERSION "$SRC_DIR/app/version.py" | cut -d'"' -f2)"
 
   # جایگزینی فایل‌ها: .env و backups و .git دست نمی‌خورند
   if command -v rsync >/dev/null 2>&1; then
@@ -125,6 +126,10 @@ if [ "$DRY_RUN" != "1" ]; then
       "$SRC_DIR/" "$DEST/"
   else
     ( cd "$SRC_DIR" && tar -cf - --exclude='.git' . ) | ( cd "$DEST" && tar -xf - )
+    # حذف فایل‌های .py که در نسخه جدید نیستند (به‌جز .env/backups)
+    ( cd "$DEST" && find app -name '*.py' | while read -r f; do
+        [ -f "$SRC_DIR/$f" ] || rm -f "$f"
+      done )
   fi
   ok "فایل‌ها به‌روزرسانی شد"
 fi
