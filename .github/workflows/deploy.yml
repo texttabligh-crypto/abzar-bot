@@ -1,0 +1,42 @@
+name: Deploy Abzar Bot
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Check connection or deploy latest main
+        type: choice
+        options: [check, deploy]
+        default: check
+permissions:
+  contents: read
+concurrency:
+  group: abzar-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Connect using pinned host key and restricted SSH key
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          OPERATION: ${{ github.event_name == 'push' && 'deploy' || inputs.operation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in check|deploy) ;; *) exit 1;; esac
+          umask 077
+          key="$RUNNER_TEMP/abzar-deploy-key"
+          hosts="$RUNNER_TEMP/abzar-known-hosts"
+          trap 'rm -f "$key" "$hosts"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$hosts"
+          ssh -i "$key" -p 22 \
+            -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$hosts" \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            root@103.75.196.37 "$OPERATION"
