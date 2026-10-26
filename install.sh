@@ -62,12 +62,22 @@ if [ -n "${TARGET_DIR:-}" ]; then
   DEST="$TARGET_DIR"
 elif [ -f "./docker-compose.yml" ] && [ -f "./main.py" ]; then
   DEST="$(pwd)"
-elif [ -d "$DEFAULT_DIR" ]; then
-  DEST="$DEFAULT_DIR"
 else
-  DEST="$DEFAULT_DIR"
+  # جستجوی نصب قبلی در مسیرهای رایج
+  DEST=""
+  for candidate in "$DEFAULT_DIR" /opt/abzar-bot /opt/tradingbot \
+                   "$HOME/trading-bot-v1" /root/trading-bot-v1 \
+                   $(ls -d /opt/*/ 2>/dev/null); do
+    if [ -f "${candidate%/}/docker-compose.yml" ] && [ -f "${candidate%/}/main.py" ]; then
+      DEST="${candidate%/}"; break
+    fi
+  done
+  DEST="${DEST:-$DEFAULT_DIR}"
 fi
-mkdir -p "$DEST"
+if ! mkdir -p "$DEST" 2>/dev/null; then
+  fail "اجازه ساخت پوشه $DEST را ندارید. با sudo اجرا کنید:  sudo bash install.sh $DEST"
+fi
+[ -w "$DEST" ] || fail "پوشه $DEST قابل نوشتن نیست. با sudo اجرا کنید:  sudo bash install.sh $DEST"
 ok "مسیر: $DEST"
 
 UPGRADE="0"
@@ -81,7 +91,8 @@ if [ "$UPGRADE" = "1" ] && [ -f "$DEST/.env" ]; then
   DB_NAME="$(grep -E '^POSTGRES_DB=' "$DEST/.env" | cut -d= -f2- || true)"
   DB_USER="${DB_USER:-tradingbot}"; DB_NAME="${DB_NAME:-tradingbot}"
   BACKUP_FILE="$DEST/backups/db-$(date +%Y%m%d-%H%M%S).sql"
-  if ( cd "$DEST" && $DC ps postgres 2>/dev/null | grep -qi running ); then
+  PG_CONTAINER="$( cd "$DEST" && $DC ps -q postgres 2>/dev/null | head -1 || true )"
+  if [ -n "$PG_CONTAINER" ]; then
     if run bash -c "cd '$DEST' && $DC exec -T postgres pg_dump -U '$DB_USER' '$DB_NAME' > '$BACKUP_FILE'" 2>/dev/null; then
       ok "بکاپ: $BACKUP_FILE"
     else
