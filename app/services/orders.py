@@ -6,6 +6,10 @@ from app.models import Cart, CartItem, Product, Order, OrderItem, User
 from app.services.catalog import get_price_for_user
 
 
+class CheckoutError(ValueError):
+    """Cart cannot be checked out without customer intervention."""
+
+
 async def get_or_create_cart(session: AsyncSession, user_id: int) -> Cart:
     cart = await session.scalar(select(Cart).where(Cart.user_id == user_id))
     if not cart:
@@ -32,6 +36,20 @@ async def create_order_from_cart(session: AsyncSession, user_id: int) -> Order |
     customer = await session.get(User, user_id)
     if not customer:
         return None
+
+    # Lock all cart products in a stable order before validating or reserving stock.
+    products = (await session.execute(
+        select(Product).where(Product.id.in_([i.product_id for i in items]))
+        .order_by(Product.id).with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalars().all()
+    by_id = {p.id: p for p in products}
+    for item in items:
+        p = by_id.get(item.product_id)
+        if not p or not p.is_active or p.stock_status in {"unavailable", "out_of_stock"}:
+            raise CheckoutError("محصولی در سبد غیرفعال یا ناموجود شده؛ سبد را اصلاح کنید.")
+        if item.quantity < 1 or (p.stock_quantity is not None and item.quantity > p.stock_quantity):
+            raise CheckoutError("موجودی محصول برای تعداد انتخاب‌شده کافی نیست.")
 
     last_id = await session.scalar(select(func.max(Order.id))) or 0
     order = Order(

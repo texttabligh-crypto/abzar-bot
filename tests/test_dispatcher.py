@@ -14,6 +14,7 @@ from aiogram.types import (
 )
 from sqlalchemy import select
 
+from app.version import APP_VERSION
 from app.bot.setup import register_routers
 from app.models import User, Product, Category
 from app.services.catalog import RETAIL, WHOLESALE
@@ -326,11 +327,11 @@ async def test_version_command_and_admin_panel_show_version(db, app):
     bot, dp, session = app
     await dp.feed_update(bot, msg_update(907, "/version", update_id=40))
     texts = session.sent_texts()
-    assert any("2.4.0" in t for t in texts), texts
+    assert any(APP_VERSION in t for t in texts), texts
     assert any("اتصال به کانال" in t for t in texts)   # فهرست قابلیت‌ها برای مدیر
 
     await dp.feed_update(bot, msg_update(907, "/admin", update_id=41))
-    assert any("2.4.0" in t for t in session.sent_texts())
+    assert any(APP_VERSION in t for t in session.sent_texts())
 
 
 @pytest.mark.asyncio
