@@ -23,6 +23,9 @@ class FakeBot:
     def __init__(self):
         self.sent: list[tuple[int, str, object]] = []
 
+    async def get_me(self):
+        return FakeUser(id=42, username="test_bot", is_bot=True)
+
     async def send_message(self, chat_id, text, reply_markup=None, **kwargs):
         self.sent.append((chat_id, text, reply_markup))
         return self
@@ -52,10 +55,17 @@ class FakeMessage:
         self.bot = bot or FakeBot()
         self.answers: list[str] = []
         self.markups: list[object] = []
+        self.edits: list[str] = []
+        self.edit_markups: list[object] = []
 
     async def answer(self, text, reply_markup=None, **kwargs):
         self.answers.append(text)
         self.markups.append(reply_markup)
+        return self
+
+    async def edit_text(self, text, reply_markup=None, **kwargs):
+        self.edits.append(text)
+        self.edit_markups.append(reply_markup)
         return self
 
     async def edit_reply_markup(self, reply_markup=None):

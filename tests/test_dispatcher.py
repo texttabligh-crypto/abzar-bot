@@ -408,3 +408,37 @@ async def test_disabled_owner_cannot_bypass_start_block(db, app):
     await dp.feed_update(bot, msg_update(983, '/start', update_id=1101))
     assert any('غیرفعال' in text for text in session.sent_texts())
     assert not any('منوی مدیریت فعال' in text for text in session.sent_texts())
+
+
+@pytest.mark.asyncio
+async def test_catalog_link_single_product_quantity_buttons_dispatcher(db, app):
+    from app.models import CartItem, PriceTier
+    async with db() as s:
+        s.add(User(telegram_id=985, is_owner=True, is_active=True, phone=None))
+        products = [Product(name=f'Browse {i}', internal_sku=f'BROWSE-{i}', base_price=100,
+                            stock_quantity=5) for i in range(8)]
+        s.add_all(products)
+        await s.flush()
+        pid = products[0].id
+        s.add(PriceTier(product_id=pid, min_qty=2, max_qty=None, unit_price=70))
+        await s.commit()
+    bot, dp, session = app
+    await dp.feed_update(bot, cb_update(985, 'menu:products', update_id=2000))
+    messages = [m for m in session.requests if isinstance(m, SendMessage)]
+    assert len(messages) == 1
+    assert messages[0].parse_mode == 'HTML'
+    assert messages[0].text.count('start=product_') == 6
+    await dp.feed_update(bot, cb_update(985, 'catalog:all:0:1', update_id=2001))
+    assert any(isinstance(m, EditMessageText) and 'Browse 6' in m.text for m in session.requests)
+    session.requests.clear()
+    await dp.feed_update(bot, msg_update(985, f'/start product_{pid}', update_id=2002))
+    assert len(session.sent_texts()) == 1 and 'Browse 0' in session.sent_texts()[0]
+    await dp.feed_update(bot, cb_update(985, f'addcart:{pid}', update_id=2003))
+    async with db() as s:
+        item = await s.scalar(select(CartItem))
+        assert item.quantity == 1
+        iid = item.id
+    await dp.feed_update(bot, cb_update(985, f'cartinc:{iid}', update_id=2004))
+    edits = [m for m in session.requests if isinstance(m, EditMessageText)]
+    assert '۱۴۰' in edits[-1].text
+    assert 'جمع کل سبد' in edits[-1].text
