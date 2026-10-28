@@ -219,6 +219,20 @@ async def start(message: Message, state: FSMContext):
             await session.refresh(user)
 
     await state.clear()
+    if payload and payload.startswith("product_"):
+        from app.bot.routers.customer import allowed_user, compact_product
+        from app.models import Product
+        raw_id = payload.removeprefix("product_")
+        if not raw_id.isascii() or not raw_id.isdigit() or len(raw_id) > 19 or not 0 < int(raw_id) < 2**63:
+            return await message.answer("لینک محصول نامعتبر است.")
+        async with SessionLocal() as session:
+            customer = await allowed_user(message, message.from_user.id, session)
+            if not customer:
+                return
+            product = await session.get(Product, int(raw_id))
+            if not product or not product.is_active:
+                return await message.answer("این محصول دیگر در دسترس نیست.")
+        return await compact_product(message, product, customer)
     admin_enabled = await is_admin_user(message.from_user.id)
     if admin_enabled:
         await message.answer("منوی مدیریت فعال است.", reply_markup=ReplyKeyboardRemove())
