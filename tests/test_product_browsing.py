@@ -39,13 +39,15 @@ async def test_catalog_is_one_sorted_message_with_links_and_pagination(db):
     assert text.count('برای سفارش محصول روی لینک زیر کلیک کنید') == 6
     assert '?start=product_' in text
     assert 'catalog:all:0:1' in callbacks(message.markups[0])
-    assert not any(c and c.startswith('addcart:') for c in callbacks(message.markups[0]))
+    assert not any(c and c.startswith(('addcart:', 'showprod:')) for c in callbacks(message.markups[0]))
+    assert set(callbacks(message.markups[0])) == {'catalog:all:0:1', 'admin:back'}
     cb = FakeCallback('catalog:all:0:1', user=FakeUser(id=7000), message=message)
     await customer.catalog_page(cb, make_state(7000))
     assert len(message.answers) == 1 and len(message.edits) == 1
     assert 'Product 06' in message.edits[-1] and 'Product 12' not in message.edits[-1]
     assert 'catalog:all:0:0' in callbacks(message.edit_markups[-1])
     assert 'catalog:all:0:2' in callbacks(message.edit_markups[-1])
+    assert not any(c and c.startswith('showprod:') for c in callbacks(message.edit_markups[-1]))
 
 
 @pytest.mark.asyncio

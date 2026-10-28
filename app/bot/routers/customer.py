@@ -141,7 +141,7 @@ async def show_products(target, stmt=None, tg_id=None, *, page=0, scope="all", r
                       f'<a href="{url}">مشاهده و سفارش محصول</a>'])
     if not rows:
         lines.append("محصولی پیدا نشد.")
-    buttons = [[InlineKeyboardButton(text=f"📦 {p.name[:60]}", callback_data=f"showprod:{p.id}")] for p in rows]
+    buttons = []
     navigation = []
     if page > 0:
         navigation.append(InlineKeyboardButton(text="⬅️ قبلی", callback_data=f"catalog:{scope}:{ref}:{page-1}"))
