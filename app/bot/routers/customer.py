@@ -5,7 +5,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton,
 )
-from sqlalchemy import select, or_
+from html import escape
+import secrets
+
+from aiogram.exceptions import TelegramBadRequest
+from sqlalchemy import select, or_, func
 
 from app.db.database import SessionLocal
 from app.models import (
@@ -13,14 +17,15 @@ from app.models import (
     PriceHistory, BankAccount, ProductChannelPost, PriceTier,
 )
 from app.bot.keyboards import product_list_actions, cart_actions, checkout_button, price_list_formats
-from app.services.orders import get_or_create_cart, create_order_from_cart
+from app.services.orders import CheckoutError, get_or_create_cart, create_order_from_cart
 from app.services.catalog import get_price_for_user, category_tree, WHOLESALE, customer_type_of
+from app.services.auth import account_state, is_admin_account
 from app.services.export import build_price_list, build_price_list_pdf
 from app.utils import fa_num, normalize_digits, stock_label, order_status_label
 
 router = Router()
 
-MAX_LIST = 12
+MAX_LIST = 6
 
 
 class CartQuantity(StatesGroup):
@@ -38,13 +43,14 @@ async def db_user(session, tg_id):
 async def allowed_user(target, tg_id, session):
     """مشتری فعال و مجاز؛ در غیر این صورت پیام مناسب و None برمی‌گرداند."""
     user = await db_user(session, tg_id)
-    if not user or not user.is_active:
+    status = account_state(user, await is_admin_account(session, user))
+    if status == "blocked":
         await target.answer("⛔ حساب شما فعال نیست. با /start شروع کنید.")
         return None
-    if customer_type_of(user) == WHOLESALE and not user.is_approved:
+    if status == "pending":
         await target.answer("⏳ حساب عمده شما در انتظار تأیید مدیریت است.")
         return None
-    if customer_type_of(user) == "retail" and not user.phone:
+    if status == "incomplete":
         await target.answer("برای تکمیل ثبت‌نام «/start» را بزنید.")
         return None
     return user
@@ -94,17 +100,86 @@ async def compact_product(target, p, user=None):
     )
 
 
-async def show_products(target, stmt=None, tg_id=None):
+def catalog_statement(scope="all", ref=0, query=""):
+    stmt = select(Product).where(Product.is_active.is_(True))
+    if scope == "brand":
+        return stmt.where(Product.brand_id == ref)
+    if scope == "category":
+        return stmt.where(Product.category_id == ref)
+    if scope == "search":
+        pattern = f"%{query}%"
+        return stmt.where(or_(
+            Product.name.ilike(pattern), Product.internal_sku.ilike(pattern),
+            Product.factory_code.ilike(pattern), Product.model.ilike(pattern),
+            Product.brand_id.in_(select(Brand.id).where(Brand.name.ilike(pattern))),
+            Product.id.in_(select(SupplierProduct.product_id).where(SupplierProduct.supplier_sku.ilike(pattern))),
+        ))
+    return stmt
+
+
+async def show_products(target, stmt=None, tg_id=None, *, page=0, scope="all", ref=0, edit=False):
     async with SessionLocal() as session:
-        user = await db_user(session, tg_id) if tg_id else None
-        stmt = stmt or select(Product).where(Product.is_active.is_(True))
-        rows = (await session.execute(stmt.order_by(Product.name).limit(MAX_LIST))).scalars().all()
+        user = await allowed_user(target, tg_id, session)
+        if not user:
+            return
+        if stmt is None:
+            stmt = catalog_statement(scope, ref)
+        count = await session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery()))
+        pages = max(1, (count + MAX_LIST - 1) // MAX_LIST)
+        page = max(0, min(page, pages - 1))
+        rows = (await session.execute(stmt.order_by(None).order_by(Product.name, Product.id)
+                .offset(page * MAX_LIST).limit(MAX_LIST))).scalars().all()
+        prices = {p.id: await get_price_for_user(session, p, 1, user) for p in rows}
+    me = await target.bot.get_me()
+    lines = [f"📦 فهرست محصولات | صفحه {fa_num(page + 1)} از {fa_num(pages)}",
+             "مرتب‌شده بر اساس نام محصول"]
+    for index, p in enumerate(rows, start=page * MAX_LIST + 1):
+        url = f"https://t.me/{me.username}?start=product_{p.id}"
+        lines.extend(["", f"<b>{fa_num(index)}. {escape(p.name[:160])}</b>",
+                      f"کد: {escape(p.internal_sku)} | قیمت: {fa_num(prices[p.id])} تومان",
+                      "برای سفارش محصول روی لینک زیر کلیک کنید:",
+                      f'<a href="{url}">مشاهده و سفارش محصول</a>'])
     if not rows:
-        return await target.answer("محصولی پیدا نشد.")
-    for p in rows:
-        await compact_product(target, p, user)
-    if len(rows) == MAX_LIST:
-        await target.answer("برای دیدن بقیه، از «🔎 جستجو» یا دسته‌بندی‌ها استفاده کنید.")
+        lines.append("محصولی پیدا نشد.")
+    buttons = [[InlineKeyboardButton(text=f"📦 {p.name[:60]}", callback_data=f"showprod:{p.id}")] for p in rows]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ قبلی", callback_data=f"catalog:{scope}:{ref}:{page-1}"))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton(text="بعدی ➡️", callback_data=f"catalog:{scope}:{ref}:{page+1}"))
+    if navigation:
+        buttons.append(navigation)
+    if scope == "category":
+        buttons.append([InlineKeyboardButton(text="🗂 بازگشت به دسته", callback_data=f"browsecat:{ref}")])
+    elif scope == "brand":
+        buttons.append([InlineKeyboardButton(text="🏷 بازگشت به برندها", callback_data="menu:brands")])
+    buttons.append([InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="admin:back")])
+    kwargs = dict(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML", disable_web_page_preview=True)
+    if edit:
+        try:
+            await target.edit_text("\n".join(lines), **kwargs)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+    else:
+        await target.answer("\n".join(lines), **kwargs)
+
+
+@router.callback_query(F.data.startswith("catalog:"))
+async def catalog_page(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, scope, ref, page = cb.data.split(":")
+        ref, page = int(ref), int(page)
+        if scope not in {"all", "brand", "category", "search"} or page < 0:
+            raise ValueError
+    except ValueError:
+        return await cb.answer("صفحه نامعتبر است.", show_alert=True)
+    query = (await state.get_data()).get("catalog_searches", {}).get(str(ref), "")
+    if scope == "search" and not query:
+        return await cb.answer("جستجوی قبلی منقضی شده؛ دوباره جستجو کنید.", show_alert=True)
+    await show_products(cb.message, catalog_statement(scope, ref, query), cb.from_user.id,
+                        page=page, scope=scope, ref=ref, edit=True)
+    await cb.answer()
 
 
 @router.message(Command("products"))
@@ -132,7 +207,7 @@ async def show_product(cb: CallbackQuery):
         if not user:
             return await cb.answer()
         p = await session.get(Product, pid)
-    if not p:
+    if not p or not p.is_active:
         return await cb.answer("محصول پیدا نشد.", show_alert=True)
     await compact_product(cb.message, p, user)
     await cb.answer()
@@ -173,7 +248,7 @@ async def browse_brand(cb: CallbackQuery):
     await show_products(
         cb.message,
         select(Product).where(Product.is_active.is_(True), Product.brand_id == bid),
-        tg_id=cb.from_user.id,
+        tg_id=cb.from_user.id, scope="brand", ref=bid,
     )
     await cb.answer()
 
@@ -238,8 +313,8 @@ async def browse_cat(cb: CallbackQuery):
     rows = []
     for child in children:
         rows.append([InlineKeyboardButton(text=f"🗂 {child.name}", callback_data=f"browsecat:{child.id}")])
-    for p in products:
-        rows.append([InlineKeyboardButton(text=f"📦 {p.name}", callback_data=f"showprod:{p.id}")])
+    if products:
+        rows.append([InlineKeyboardButton(text="📦 نمایش محصولات این دسته", callback_data=f"catalog:category:{cid}:0")])
     if parent_category and parent_category.parent_id:
         rows.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"browsecat:{parent_category.parent_id}")])
 
@@ -273,48 +348,57 @@ async def search_result(message: Message, state: FSMContext):
     q = normalize_digits((message.text or "").strip())
     if not q:
         return await message.answer("عبارت جستجو خالی است.")
-    async with SessionLocal() as session:
-        if not await allowed_user(message, message.from_user.id, session):
-            await state.clear()
-            return
-        brand_ids = (await session.execute(select(Brand.id).where(Brand.name.ilike(f"%{q}%")))).scalars().all()
-        supplier_product_ids = (await session.execute(
-            select(SupplierProduct.product_id).where(SupplierProduct.supplier_sku.ilike(f"%{q}%"))
-        )).scalars().all()
-        rows = (await session.execute(
-            select(Product).where(
-                Product.is_active.is_(True),
-                or_(
-                    Product.name.ilike(f"%{q}%"),
-                    Product.internal_sku.ilike(f"%{q}%"),
-                    Product.factory_code.ilike(f"%{q}%"),
-                    Product.model.ilike(f"%{q}%"),
-                    Product.brand_id.in_(brand_ids or [-1]),
-                    Product.id.in_(supplier_product_ids or [-1]),
-                )
-            ).limit(30)
-        )).scalars().all()
-    if not rows:
-        await message.answer("محصولی پیدا نشد.")
-    else:
-        await show_products(
-            message,
-            select(Product).where(Product.id.in_([p.id for p in rows])),
-            tg_id=message.from_user.id,
-        )
-    await state.clear()
+    await state.set_state(None)
+    searches = (await state.get_data()).get("catalog_searches", {})
+    ref = secrets.randbits(32)
+    searches[str(ref)] = q
+    searches = dict(list(searches.items())[-5:])
+    await state.update_data(catalog_searches=searches)
+    await show_products(message, catalog_statement("search", query=q), message.from_user.id, scope="search", ref=ref)
 
 
 @router.callback_query(F.data.startswith("addcart:"))
 async def ask_qty(cb: CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[1])
     async with SessionLocal() as session:
         user = await allowed_user(cb.message, cb.from_user.id, session)
         if not user:
             return await cb.answer()
-    await state.update_data(product_id=int(cb.data.split(":")[1]))
-    await state.set_state(CartQuantity.qty)
-    await cb.message.answer("تعداد موردنظر را فقط به عدد ارسال کنید.")
+        product = await session.get(Product, pid)
+        if not product or not product.is_active or product.stock_status in {"unavailable", "out_of_stock"} or product.stock_quantity == 0:
+            return await cb.answer("این محصول در دسترس نیست.", show_alert=True)
+        cart = await get_or_create_cart(session, user.id)
+        await session.execute(select(Cart).where(Cart.id == cart.id).with_for_update())
+        item = await session.scalar(select(CartItem).where(CartItem.cart_id == cart.id, CartItem.product_id == pid))
+        if not item:
+            item = CartItem(cart_id=cart.id, product_id=pid, quantity=1)
+            session.add(item)
+        await session.flush()
+        text, markup = await cart_item_card(session, user, product, item)
+        await session.commit()
+    await state.set_state(None)
+    await cb.message.answer(text, reply_markup=markup)
     await cb.answer()
+
+
+async def cart_item_card(session, user, product, item):
+    unit = await get_price_for_user(session, product, item.quantity, user)
+    total = 0
+    for row in (await session.execute(select(CartItem).where(CartItem.cart_id == item.cart_id))).scalars():
+        p = await session.get(Product, row.product_id)
+        if p:
+            total += (await get_price_for_user(session, p, row.quantity, user)) * row.quantity
+    text = (f"🛒 {product.name}\nتعداد: {fa_num(item.quantity)}\n"
+            f"قیمت واحد برای این تعداد: {fa_num(unit)} تومان\n"
+            f"جمع این محصول: {fa_num(unit * item.quantity)} تومان\n"
+            f"جمع کل سبد: {fa_num(total)} تومان\n\n"
+            "تعداد را با ➕ و ➖ تغییر دهید؛ قیمت پلکانی خودکار محاسبه می‌شود.")
+    markup = cart_actions(item.id)
+    markup.inline_keyboard.extend([
+        [InlineKeyboardButton(text="🧺 مشاهده سبد خرید", callback_data="menu:cart")],
+        [InlineKeyboardButton(text="✅ ثبت نهایی سفارش", callback_data="checkout")],
+    ])
+    return text, markup
 
 
 @router.message(CartQuantity.qty)
@@ -330,9 +414,11 @@ async def set_qty(message: Message, state: FSMContext):
             await state.clear()
             return
         product = await session.get(Product, data.get("product_id"))
-        if not product or not product.is_active:
+        if not product or not product.is_active or product.stock_status in {"unavailable", "out_of_stock"}:
             await state.clear()
             return await message.answer("این محصول موجود نیست.")
+        if product.stock_quantity is not None and qty > product.stock_quantity:
+            return await message.answer("تعداد از موجودی محصول بیشتر است.")
         cart = await get_or_create_cart(session, user.id)
         item = await session.scalar(select(CartItem).where(
             CartItem.cart_id == cart.id, CartItem.product_id == product.id
@@ -341,13 +427,12 @@ async def set_qty(message: Message, state: FSMContext):
             item.quantity = qty
         else:
             session.add(CartItem(cart_id=cart.id, product_id=product.id, quantity=qty))
-        unit = await get_price_for_user(session, product, qty, user)
+        await session.flush()
+        item = await session.scalar(select(CartItem).where(CartItem.cart_id == cart.id, CartItem.product_id == product.id))
+        text, markup = await cart_item_card(session, user, product, item)
         await session.commit()
     await state.clear()
-    await message.answer(
-        f"✅ به سبد اضافه شد.\n{product.name}\nتعداد: {fa_num(qty)}\n"
-        f"قیمت واحد: {fa_num(unit)} تومان\nجمع: {fa_num(unit * qty)} تومان"
-    )
+    await message.answer(text, reply_markup=markup)
 
 
 async def render_cart(target, tg_id):
@@ -389,22 +474,39 @@ async def cart_inline(cb: CallbackQuery):
 async def cart_change(cb: CallbackQuery):
     action, raw_id = cb.data.split(":")
     async with SessionLocal() as session:
-        user = await db_user(session, cb.from_user.id)
-        item = await session.get(CartItem, int(raw_id))
-        if not item or not user:
-            return await cb.answer("آیتم پیدا نشد.", show_alert=True)
+        user = await allowed_user(cb.message, cb.from_user.id, session)
+        if not user:
+            return await cb.answer()
+        item = await session.scalar(select(CartItem).where(CartItem.id == int(raw_id)).with_for_update())
+        if not item:
+            return await cb.answer("این آیتم دیگر در سبد نیست.", show_alert=True)
         cart = await session.get(Cart, item.cart_id)
         if not cart or cart.user_id != user.id:
             return await cb.answer("این آیتم متعلق به سبد شما نیست.", show_alert=True)
-        if action == "cartdel" or (action == "cartdec" and item.quantity <= 1):
+        if action == "cartdel":
             await session.delete(item)
-        elif action == "cartinc":
-            item.quantity += 1
+            await session.commit()
+            text = "🗑 محصول از سبد حذف شد."
+            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧺 مشاهده سبد", callback_data="menu:cart")]])
         else:
-            item.quantity -= 1
-        await session.commit()
-    await cb.answer("سبد به‌روزرسانی شد.")
-    await render_cart(cb.message, cb.from_user.id)
+            product = await session.get(Product, item.product_id)
+            if not product or not product.is_active or product.stock_status in {"unavailable", "out_of_stock"}:
+                return await cb.answer("محصول در دسترس نیست؛ آن را از سبد حذف کنید.", show_alert=True)
+            qty = item.quantity + (1 if action == "cartinc" else -1)
+            if qty < 1:
+                return await cb.answer("حداقل تعداد یک است؛ برای حذف، 🗑 را بزنید.")
+            if product.stock_quantity is not None and qty > product.stock_quantity:
+                return await cb.answer("تعداد از موجودی محصول بیشتر است.", show_alert=True)
+            item.quantity = qty
+            await session.flush()
+            text, markup = await cart_item_card(session, user, product, item)
+            await session.commit()
+    try:
+        await cb.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+    await cb.answer()
 
 
 @router.callback_query(F.data == "checkout")
@@ -413,7 +515,11 @@ async def checkout(cb: CallbackQuery):
         user = await allowed_user(cb.message, cb.from_user.id, session)
         if not user:
             return await cb.answer()
-        order = await create_order_from_cart(session, user.id)
+        try:
+            order = await create_order_from_cart(session, user.id)
+        except CheckoutError as exc:
+            await session.rollback()
+            return await cb.answer(str(exc), show_alert=True)
         if not order:
             return await cb.answer("سبد خالی است.", show_alert=True)
         account = await session.scalar(select(BankAccount).where(
@@ -471,9 +577,10 @@ async def price_inline(cb: CallbackQuery):
 @router.callback_query(F.data == "pricefmt:xlsx")
 async def price_xlsx(cb: CallbackQuery):
     async with SessionLocal() as session:
-        if not await allowed_user(cb.message, cb.from_user.id, session):
+        user = await allowed_user(cb.message, cb.from_user.id, session)
+        if not user:
             return await cb.answer()
-        data = await build_price_list(session)
+        data = await build_price_list(session, include_wholesale=customer_type_of(user) == WHOLESALE)
     await cb.message.answer_document(BufferedInputFile(data.read(), filename="price-list.xlsx"))
     await cb.answer()
 
@@ -481,9 +588,10 @@ async def price_xlsx(cb: CallbackQuery):
 @router.callback_query(F.data == "pricefmt:pdf")
 async def price_pdf(cb: CallbackQuery):
     async with SessionLocal() as session:
-        if not await allowed_user(cb.message, cb.from_user.id, session):
+        user = await allowed_user(cb.message, cb.from_user.id, session)
+        if not user:
             return await cb.answer()
-        data = await build_price_list_pdf(session)
+        data = await build_price_list_pdf(session, include_wholesale=customer_type_of(user) == WHOLESALE)
     await cb.message.answer_document(BufferedInputFile(data.read(), filename="price-list.pdf"))
     await cb.answer()
 

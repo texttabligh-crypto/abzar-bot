@@ -51,7 +51,7 @@ async def _rows(session):
     return out
 
 
-async def build_price_list(session) -> BytesIO:
+async def build_price_list(session, include_wholesale: bool = True) -> BytesIO:
     rows = await _rows(session)
     wb = Workbook()
     ws = wb.active
@@ -59,6 +59,8 @@ async def build_price_list(session) -> BytesIO:
     ws.append(["کد", "نام محصول", "برند", "قیمت خرده (تومان)", "قیمت عمده (تومان)", "واحد", "وضعیت", "لینک کانال"])
     for r in rows:
         ws.append([r["sku"], r["name"], r["brand"], r["price"], r["wholesale_price"], r["unit"], r["stock"], r["url"]])
+    if not include_wholesale:
+        ws.delete_cols(5)
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     widths = [16, 38, 22, 18, 18, 12, 16, 45]
@@ -70,7 +72,7 @@ async def build_price_list(session) -> BytesIO:
     return out
 
 
-async def build_price_list_pdf(session) -> BytesIO:
+async def build_price_list_pdf(session, include_wholesale: bool = True) -> BytesIO:
     rows = await _rows(session)
     out = BytesIO()
     page = landscape(A4)
@@ -131,7 +133,12 @@ async def build_price_list_pdf(session) -> BytesIO:
             Paragraph(rtl(r["stock"]), cell_style),
         ])
 
-    table = Table(data, repeatRows=1, colWidths=[28*mm, 62*mm, 38*mm, 34*mm, 34*mm, 22*mm, 30*mm])
+    widths = [28*mm, 62*mm, 38*mm, 34*mm, 34*mm, 22*mm, 30*mm]
+    if not include_wholesale:
+        for row in data:
+            del row[4]
+        del widths[4]
+    table = Table(data, repeatRows=1, colWidths=widths)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E9ECEF")),
         ("FONTNAME", (0,0), (-1,0), "DejaVuBold"),
