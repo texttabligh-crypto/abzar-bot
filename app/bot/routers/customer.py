@@ -13,8 +13,9 @@ from app.models import (
     PriceHistory, BankAccount, ProductChannelPost, PriceTier,
 )
 from app.bot.keyboards import product_list_actions, cart_actions, checkout_button, price_list_formats
-from app.services.orders import get_or_create_cart, create_order_from_cart
+from app.services.orders import CheckoutError, get_or_create_cart, create_order_from_cart
 from app.services.catalog import get_price_for_user, category_tree, WHOLESALE, customer_type_of
+from app.services.auth import account_state, is_admin_account
 from app.services.export import build_price_list, build_price_list_pdf
 from app.utils import fa_num, normalize_digits, stock_label, order_status_label
 
@@ -38,13 +39,14 @@ async def db_user(session, tg_id):
 async def allowed_user(target, tg_id, session):
     """مشتری فعال و مجاز؛ در غیر این صورت پیام مناسب و None برمی‌گرداند."""
     user = await db_user(session, tg_id)
-    if not user or not user.is_active:
+    status = account_state(user, await is_admin_account(session, user))
+    if status == "blocked":
         await target.answer("⛔ حساب شما فعال نیست. با /start شروع کنید.")
         return None
-    if customer_type_of(user) == WHOLESALE and not user.is_approved:
+    if status == "pending":
         await target.answer("⏳ حساب عمده شما در انتظار تأیید مدیریت است.")
         return None
-    if customer_type_of(user) == "retail" and not user.phone:
+    if status == "incomplete":
         await target.answer("برای تکمیل ثبت‌نام «/start» را بزنید.")
         return None
     return user
@@ -413,7 +415,11 @@ async def checkout(cb: CallbackQuery):
         user = await allowed_user(cb.message, cb.from_user.id, session)
         if not user:
             return await cb.answer()
-        order = await create_order_from_cart(session, user.id)
+        try:
+            order = await create_order_from_cart(session, user.id)
+        except CheckoutError as exc:
+            await session.rollback()
+            return await cb.answer(str(exc), show_alert=True)
         if not order:
             return await cb.answer("سبد خالی است.", show_alert=True)
         account = await session.scalar(select(BankAccount).where(
@@ -471,9 +477,10 @@ async def price_inline(cb: CallbackQuery):
 @router.callback_query(F.data == "pricefmt:xlsx")
 async def price_xlsx(cb: CallbackQuery):
     async with SessionLocal() as session:
-        if not await allowed_user(cb.message, cb.from_user.id, session):
+        user = await allowed_user(cb.message, cb.from_user.id, session)
+        if not user:
             return await cb.answer()
-        data = await build_price_list(session)
+        data = await build_price_list(session, include_wholesale=customer_type_of(user) == WHOLESALE)
     await cb.message.answer_document(BufferedInputFile(data.read(), filename="price-list.xlsx"))
     await cb.answer()
 
@@ -481,9 +488,10 @@ async def price_xlsx(cb: CallbackQuery):
 @router.callback_query(F.data == "pricefmt:pdf")
 async def price_pdf(cb: CallbackQuery):
     async with SessionLocal() as session:
-        if not await allowed_user(cb.message, cb.from_user.id, session):
+        user = await allowed_user(cb.message, cb.from_user.id, session)
+        if not user:
             return await cb.answer()
-        data = await build_price_list_pdf(session)
+        data = await build_price_list_pdf(session, include_wholesale=customer_type_of(user) == WHOLESALE)
     await cb.message.answer_document(BufferedInputFile(data.read(), filename="price-list.pdf"))
     await cb.answer()
 

@@ -14,6 +14,7 @@ from aiogram.types import (
 )
 from sqlalchemy import select
 
+from app.version import APP_VERSION
 from app.bot.setup import register_routers
 from app.models import User, Product, Category
 from app.services.catalog import RETAIL, WHOLESALE
@@ -326,11 +327,11 @@ async def test_version_command_and_admin_panel_show_version(db, app):
     bot, dp, session = app
     await dp.feed_update(bot, msg_update(907, "/version", update_id=40))
     texts = session.sent_texts()
-    assert any("2.4.0" in t for t in texts), texts
+    assert any(APP_VERSION in t for t in texts), texts
     assert any("اتصال به کانال" in t for t in texts)   # فهرست قابلیت‌ها برای مدیر
 
     await dp.feed_update(bot, msg_update(907, "/admin", update_id=41))
-    assert any("2.4.0" in t for t in session.sent_texts())
+    assert any(APP_VERSION in t for t in session.sent_texts())
 
 
 @pytest.mark.asyncio
@@ -346,3 +347,64 @@ async def test_old_menu_button_gives_clear_message(db, app):
     answers = [m for m in session.requests if isinstance(m, AnswerCallbackQuery)]
     assert answers, "باید به کاربر پاسخ داده شود"
     assert "منوی قبلی" in (answers[-1].text or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('role', ['owner', 'manager'])
+async def test_staff_without_phone_can_use_main_menu(db, app, role):
+    """Regression: /start must not allow staff then customer buttons reject them."""
+    from app.models import Permission, UserPermission
+    uid = 980 if role == 'owner' else 981
+    async with db() as s:
+        staff = User(telegram_id=uid, is_owner=role == 'owner', is_active=True,
+                     is_approved=False, customer_type=RETAIL, phone=None)
+        s.add(staff)
+        if role == 'manager':
+            permission = Permission(code='products.edit', title='Edit products')
+            s.add(permission)
+            await s.flush()
+            s.add(UserPermission(user_id=staff.id, permission_id=permission.id, is_allowed=True))
+        await s.commit()
+    bot, dp, session = app
+    await dp.feed_update(bot, msg_update(uid, '/start', update_id=1000))
+    await dp.feed_update(bot, msg_update(uid, '/menu', update_id=1001))
+    for offset, callback in enumerate(['menu:products', 'menu:brands', 'menu:categories',
+                                     'menu:cart', 'menu:orders', 'menu:changes', 'menu:admin',
+                                     'menu:pricelist', 'menu:support', 'menu:search']):
+        await dp.feed_update(bot, cb_update(uid, callback, update_id=1010+offset))
+    texts = session.sent_texts()
+    assert not any('تکمیل ثبت' in text or 'در انتظار تأیید' in text for text in texts), texts
+    assert any('پنل مدیریت' in text for text in texts)
+    assert any('سبد خرید خالی' in text for text in texts)
+    async with db() as s:
+        staff = await s.scalar(select(User).where(User.telegram_id == uid))
+        assert staff.phone is None  # Do not fabricate customer profile data.
+        assert staff.customer_type == RETAIL
+        assert staff.is_approved is False
+
+
+@pytest.mark.asyncio
+async def test_approved_wholesale_start_does_not_restart_registration(db, app):
+    async with db() as s:
+        s.add(User(telegram_id=982, is_active=True, is_approved=True,
+                   customer_type=WHOLESALE, phone='0912', first_name='Buyer', shop_name='Shop'))
+        await s.commit()
+    bot, dp, session = app
+    await dp.feed_update(bot, msg_update(982, '/start', update_id=1100))
+    texts = session.sent_texts()
+    assert any('منوی اصلی' in text for text in texts), texts
+    assert not any('نام و نام خانوادگی' in text or 'نام فروشگاه' in text for text in texts)
+    async with db() as s:
+        user = await s.scalar(select(User).where(User.telegram_id == 982))
+        assert user.is_approved and user.customer_type == WHOLESALE
+
+
+@pytest.mark.asyncio
+async def test_disabled_owner_cannot_bypass_start_block(db, app):
+    async with db() as s:
+        s.add(User(telegram_id=983, is_owner=True, is_active=False, phone=None))
+        await s.commit()
+    bot, dp, session = app
+    await dp.feed_update(bot, msg_update(983, '/start', update_id=1101))
+    assert any('غیرفعال' in text for text in session.sent_texts())
+    assert not any('منوی مدیریت فعال' in text for text in session.sent_texts())

@@ -16,7 +16,7 @@ from app.bot.keyboards import (
     main_menu, admin_menu, request_phone_keyboard, customer_type_keyboard,
     wholesale_review_keyboard,
 )
-from app.services.auth import get_allowed_permission_codes, is_admin_user
+from app.services.auth import get_allowed_permission_codes, is_admin_user, account_state
 from app.services.catalog import RETAIL, WHOLESALE, customer_type_of
 from app.services.orders import customer_name
 from app.version import version_text, short_version
@@ -56,16 +56,6 @@ async def get_user(tg_id):
 async def setting(session, key, default=None):
     row = await session.get(SystemSetting, key)
     return row.value if row and row.value is not None else default
-
-
-def account_state(u) -> str:
-    if not u or not u.is_active:
-        return BLOCKED
-    if u.is_owner:
-        return ACTIVE
-    if customer_type_of(u) == RETAIL:
-        return ACTIVE if u.phone else INCOMPLETE
-    return ACTIVE if u.is_approved else PENDING
 
 
 async def set_chat_admin_commands(bot, tg_id: int, enabled: bool):
@@ -230,11 +220,11 @@ async def start(message: Message, state: FSMContext):
 
     await state.clear()
     admin_enabled = await is_admin_user(message.from_user.id)
-    if user.is_owner or admin_enabled:
+    if admin_enabled:
         await message.answer("منوی مدیریت فعال است.", reply_markup=ReplyKeyboardRemove())
         return await send_main_menu(message, user, True)
 
-    status = account_state(user)
+    status = account_state(user, admin_enabled)
     if status == BLOCKED:
         return await message.answer("⛔ حساب شما توسط مدیریت غیرفعال شده است. برای پیگیری با پشتیبانی تماس بگیرید.")
     if status == PENDING:
@@ -242,10 +232,7 @@ async def start(message: Message, state: FSMContext):
             "⏳ درخواست حساب عمده شما در حال بررسی است.\n"
             "پس از تأیید مدیریت، قیمت‌های عمده و پلکانی برای شما فعال می‌شود."
         )
-    if status == INCOMPLETE or customer_type_of(user) == WHOLESALE:
-        if customer_type_of(user) == WHOLESALE and user.phone and user.shop_name and user.first_name:
-            # پروفایل عمده کامل است ولی هنوز تأیید نشده (PENDING بالا هندل شده) — این حالت نادر است.
-            return await begin_wholesale(message, state)
+    if status == INCOMPLETE:
         await message.answer("منوی قبلی حذف شد.", reply_markup=ReplyKeyboardRemove())
         return await ask_customer_type(message, state)
 
@@ -438,7 +425,7 @@ async def menu_cmd(message: Message):
     admin_enabled = await is_admin_user(message.from_user.id)
     if not user:
         return await message.answer("برای شروع «/start» را بزنید.")
-    status = account_state(user)
+    status = account_state(user, admin_enabled)
     if status == BLOCKED:
         return await message.answer("⛔ حساب شما غیرفعال است.")
     if status == PENDING:
