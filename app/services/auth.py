@@ -35,20 +35,39 @@ async def get_allowed_permission_codes(tg_id: int) -> set[str]:
         return set(rows)
 
 
+async def is_admin_account(session, user: User | None) -> bool:
+    """Use current permissions, never registration completeness, to identify staff."""
+    if not user or not user.is_active:
+        return False
+    if user.is_owner:
+        return True
+    return bool(await session.scalar(
+        select(UserPermission.id).where(
+            UserPermission.user_id == user.id,
+            UserPermission.is_allowed.is_(True),
+        ).limit(1)
+    ))
+
+
+def account_state(user: User | None, admin_enabled: bool = False) -> str:
+    """Shared policy for /start, /menu and customer actions.
+
+    Staff do not need customer onboarding, but disabled staff stay blocked.
+    Customer segment and wholesale pricing are not changed by this exemption.
+    """
+    if not user or not user.is_active:
+        return "blocked"
+    if user.is_owner or admin_enabled:
+        return "active"
+    if customer_type_of(user) == WHOLESALE:
+        return "active" if user.is_approved else "pending"
+    return "active" if user.phone else "incomplete"
+
+
 async def is_admin_user(tg_id: int) -> bool:
     async with SessionLocal() as session:
         user = await session.scalar(select(User).where(User.telegram_id == tg_id))
-        if not user or not user.is_active:
-            return False
-        if user.is_owner:
-            return True
-        exists = await session.scalar(
-            select(UserPermission.id).where(
-                UserPermission.user_id == user.id,
-                UserPermission.is_allowed.is_(True),
-            ).limit(1)
-        )
-        return bool(exists)
+        return await is_admin_account(session, user)
 
 
 async def has_permission(tg_id: int, code: str) -> bool:
