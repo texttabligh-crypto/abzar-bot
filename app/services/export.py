@@ -19,6 +19,7 @@ from bidi.algorithm import get_display
 from app.models import Product, Brand, ProductChannelPost, SystemSetting
 from app.core.config import settings
 from app.utils import stock_label
+from app.services.catalog import hidden_category_ids, visible_products_filter
 
 
 def rtl(text) -> str:
@@ -27,9 +28,11 @@ def rtl(text) -> str:
 
 
 async def _rows(session):
-    products = (await session.execute(
-        select(Product).where(Product.is_active.is_(True)).order_by(Product.base_price, Product.name)
-    )).scalars().all()
+    stmt = select(Product).where(Product.is_active.is_(True))
+    visible = visible_products_filter(await hidden_category_ids(session))
+    if visible is not None:
+        stmt = stmt.where(visible)
+    products = (await session.execute(stmt.order_by(Product.base_price, Product.name))).scalars().all()
     out = []
     for p in products:
         brand = await session.get(Brand, p.brand_id) if p.brand_id else None

@@ -155,23 +155,64 @@ async def register_receipt(message: Message, order_id: int, file_id: str, *, cus
             part for part in (user.first_name, user.last_name) if part
         ) or "-"
         shop = order.shop_name_snapshot or "-"
+        phone = order.customer_phone_snapshot or user.phone or "-"
 
-    await message.answer("✅ فیش دریافت شد و برای بررسی مدیریت ارسال شد.")
+    await message.answer(
+        "✅ فیش دریافت شد و برای بررسی مدیریت ارسال شد.\n"
+        "پس از تأیید، از همین ربات به شما اطلاع داده می‌شود."
+    )
     caption = (
         f"💳 فیش جدید\nسفارش: {order_no}\n"
         f"مشتری: {customer}\nمغازه: {shop}\n"
+        f"تلفن: {phone}\n"
         f"مبلغ: {fa_num(total)} تومان"
     )
+    sent_to: list[list[int]] = []
     for tg_id in recipients:
         try:
-            await message.bot.send_photo(
+            sent = await message.bot.send_photo(
                 tg_id, payment.receipt_file_id, caption=caption,
                 reply_markup=payment_review(payment.id),
             )
+            mid = getattr(sent, "message_id", None)
+            if isinstance(mid, int):
+                sent_to.append([tg_id, mid])
         except Exception:
             pass
 
+    # نسخه‌ای که هر مدیر گرفت ذخیره می‌شود تا با اولین تأیید/رد، برای همه بسته شود.
+    async with SessionLocal() as session:
+        row = await session.get(Payment, payment.id)
+        if row:
+            row.review_messages = {"caption": caption, "messages": sent_to}
+            await session.commit()
+
     return True
+
+
+def actor_name(user: User | None, fallback) -> str:
+    if user:
+        name = " ".join(p for p in (user.first_name, user.last_name) if p).strip()
+        if name:
+            return name
+    return getattr(fallback, "full_name", None) or "مدیر"
+
+
+async def close_review_messages(bot, review: dict | None, note: str):
+    """Remove the approve/reject buttons from every manager's copy of the receipt."""
+    if not review:
+        return
+    caption = f"{review.get('caption') or ''}\n\n{note}".strip()[:1024]
+    for chat_id, message_id in review.get("messages") or []:
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id, message_id=message_id, caption=caption, reply_markup=None
+            )
+        except Exception:
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+            except Exception:
+                pass
 
 @router.callback_query(F.data.startswith("payorder:"))
 async def choose_receipt_order(cb: CallbackQuery):
@@ -202,10 +243,11 @@ async def approve_payment(cb: CallbackQuery):
     payment_id = int(cb.data.split(":")[1])
     async with SessionLocal() as session:
         admin = await get_user(session, cb.from_user.id)
-        payment = await session.get(Payment, payment_id)
+        # Row lock: if two managers tap at the same time only the first one wins.
+        payment = await session.scalar(select(Payment).where(Payment.id == payment_id).with_for_update())
         if not payment or payment.status != "PENDING":
-            return await cb.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True)
-        order = await session.get(Order, payment.order_id)
+            return await cb.answer("این پرداخت قبلاً توسط مدیر دیگری بررسی شده است.", show_alert=True)
+        order = await session.scalar(select(Order).where(Order.id == payment.order_id).with_for_update())
         if not order:
             return await cb.answer("سفارش پیدا نشد.", show_alert=True)
         if order.status not in ("PAYMENT_REVIEW", "WAITING_PAYMENT"):
@@ -225,8 +267,12 @@ async def approve_payment(cb: CallbackQuery):
         ))
         await session.commit()
         order_no = order.order_no
+        total = order.total_amount
         customer_tg = customer.telegram_id if customer else None
+        review = payment.review_messages
+        who = actor_name(admin, cb.from_user)
 
+    await close_review_messages(cb.bot, review, f"✅ تأیید شد توسط {who}")
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -234,7 +280,11 @@ async def approve_payment(cb: CallbackQuery):
     if customer_tg:
         try:
             await cb.bot.send_message(
-                customer_tg, f"✅ پرداخت سفارش {order_no} تأیید شد و سفارش با موفقیت ثبت شد."
+                customer_tg,
+                f"✅ سفارش شما تأیید شد.\n\n"
+                f"شماره سفارش: {order_no}\n"
+                f"مبلغ: {fa_num(total)} تومان\n\n"
+                "پرداخت شما تأیید شد و سفارش برای آماده‌سازی ارسال شد. ممنون از خرید شما 🙏",
             )
         except Exception:
             pass
@@ -248,7 +298,7 @@ async def reject_payment(cb: CallbackQuery):
     async with SessionLocal() as session:
         payment = await session.get(Payment, payment_id)
         if not payment or payment.status != "PENDING":
-            return await cb.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True)
+            return await cb.answer("این پرداخت قبلاً توسط مدیر دیگری بررسی شده است.", show_alert=True)
     await cb.message.answer("دلیل رد فیش را انتخاب کنید:", reply_markup=reject_reasons(payment_id))
     await cb.answer()
 
@@ -263,10 +313,10 @@ async def reject_reason(cb: CallbackQuery):
         return await cb.answer("درخواست نامعتبر است.", show_alert=True)
     async with SessionLocal() as session:
         admin = await get_user(session, cb.from_user.id)
-        payment = await session.get(Payment, payment_id)
+        payment = await session.scalar(select(Payment).where(Payment.id == payment_id).with_for_update())
         if not payment or payment.status != "PENDING":
-            return await cb.answer("این پرداخت قبلاً بررسی شده است.", show_alert=True)
-        order = await session.get(Order, payment.order_id)
+            return await cb.answer("این پرداخت قبلاً توسط مدیر دیگری بررسی شده است.", show_alert=True)
+        order = await session.scalar(select(Order).where(Order.id == payment.order_id).with_for_update())
         if not order:
             return await cb.answer("سفارش پیدا نشد.", show_alert=True)
         customer = await session.get(User, order.user_id)
@@ -283,7 +333,10 @@ async def reject_reason(cb: CallbackQuery):
         await session.commit()
         order_no = order.order_no
         customer_tg = customer.telegram_id if customer else None
+        review = payment.review_messages
+        who = actor_name(admin, cb.from_user)
 
+    await close_review_messages(cb.bot, review, f"❌ رد شد توسط {who} — دلیل: {reason}")
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:

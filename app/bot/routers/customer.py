@@ -4,6 +4,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton,
+    CopyTextButton,
 )
 from html import escape
 import secrets
@@ -18,7 +19,11 @@ from app.models import (
 )
 from app.bot.keyboards import product_list_actions, cart_actions, checkout_button, price_list_formats
 from app.services.orders import CheckoutError, get_or_create_cart, create_order_from_cart
-from app.services.catalog import get_price_for_user, category_tree, WHOLESALE, customer_type_of
+from app.services.catalog import (
+    get_price_for_user, category_tree, WHOLESALE, customer_type_of, RETAIL_MAX_QTY,
+    hidden_category_ids, visible_products_filter, product_visible, is_available,
+)
+from app.services.publishing import sync_product_post
 from app.services.auth import account_state, is_admin_account
 from app.services.export import build_price_list, build_price_list_pdf
 from app.utils import fa_num, normalize_digits, stock_label, order_status_label
@@ -26,9 +31,14 @@ from app.utils import fa_num, normalize_digits, stock_label, order_status_label
 router = Router()
 
 MAX_LIST = 6
+MAX_BUY_QTY = 9999
 
 
 class CartQuantity(StatesGroup):
+    qty = State()
+
+
+class BuyQty(StatesGroup):
     qty = State()
 
 
@@ -92,6 +102,8 @@ async def compact_product(target, p, user=None):
             lines.append("🎁 این محصول قیمت پلکانی دارد (برای تعداد بیشتر، قیمت بهتر).")
     else:
         lines.append(f"قیمت: {fa_num(p.base_price)} تومان")
+        if p.wholesale_price and p.wholesale_price != p.base_price:
+            lines.append(f"📦 خرید بیش از {fa_num(RETAIL_MAX_QTY)} عدد: {fa_num(p.wholesale_price)} تومان")
 
     lines.append(f"وضعیت: {stock_label(p.stock_status)}")
     await target.answer(
@@ -124,6 +136,9 @@ async def show_products(target, stmt=None, tg_id=None, *, page=0, scope="all", r
             return
         if stmt is None:
             stmt = catalog_statement(scope, ref)
+        visible = visible_products_filter(await hidden_category_ids(session))
+        if visible is not None:
+            stmt = stmt.where(visible)
         count = await session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery()))
         pages = max(1, (count + MAX_LIST - 1) // MAX_LIST)
         page = max(0, min(page, pages - 1))
@@ -207,7 +222,8 @@ async def show_product(cb: CallbackQuery):
         if not user:
             return await cb.answer()
         p = await session.get(Product, pid)
-    if not p or not p.is_active:
+        visible = await product_visible(session, p)
+    if not visible:
         return await cb.answer("محصول پیدا نشد.", show_alert=True)
     await compact_product(cb.message, p, user)
     await cb.answer()
@@ -365,7 +381,7 @@ async def ask_qty(cb: CallbackQuery, state: FSMContext):
         if not user:
             return await cb.answer()
         product = await session.get(Product, pid)
-        if not product or not product.is_active or product.stock_status in {"unavailable", "out_of_stock"} or product.stock_quantity == 0:
+        if not is_available(product) or not await product_visible(session, product):
             return await cb.answer("این محصول در دسترس نیست.", show_alert=True)
         cart = await get_or_create_cart(session, user.id)
         await session.execute(select(Cart).where(Cart.id == cart.id).with_for_update())
@@ -509,6 +525,37 @@ async def cart_change(cb: CallbackQuery):
     await cb.answer()
 
 
+def payment_text_and_markup(order, account):
+    amount = int(order.total_amount or 0)
+    lines = [
+        f"✅ سفارش {escape(order.order_no)} ثبت شد.",
+        "",
+        f"💰 مبلغ قابل پرداخت: <code>{amount}</code> تومان",
+        f"({fa_num(amount)} تومان)",
+    ]
+    buttons = []
+    card = "".join(ch for ch in normalize_digits(account.card_number or "") if ch.isdigit()) if account else ""
+    if account and card:
+        lines += ["", f"💳 شماره کارت:\n<code>{card}</code>"]
+        if account.holder_name:
+            lines.append(f"👤 به نام: {escape(account.holder_name)}")
+        buttons.append([InlineKeyboardButton(text="📋 کپی شماره کارت", copy_text=CopyTextButton(text=card))])
+    if account and account.iban:
+        iban = account.iban.replace(" ", "")
+        lines.append(f"🏦 شبا:\n<code>{escape(iban)}</code>")
+        buttons.append([InlineKeyboardButton(text="📋 کپی شبا", copy_text=CopyTextButton(text=iban[:256]))])
+    buttons.insert(0, [InlineKeyboardButton(text="📋 کپی مبلغ", copy_text=CopyTextButton(text=str(amount)))])
+    if not card:
+        lines += ["", "⚠️ شماره کارت هنوز در ربات ثبت نشده؛ برای پرداخت با پشتیبانی تماس بگیرید."]
+    lines += [
+        "",
+        "برای کپی، روی عدد یا دکمه‌های زیر بزنید.",
+        "",
+        "📸 بعد از واریز، <b>عکس فیش</b> را همین‌جا ارسال کنید.",
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @router.callback_query(F.data == "checkout")
 async def checkout(cb: CallbackQuery):
     async with SessionLocal() as session:
@@ -524,17 +571,205 @@ async def checkout(cb: CallbackQuery):
             return await cb.answer("سبد خالی است.", show_alert=True)
         account = await session.scalar(select(BankAccount).where(
             BankAccount.is_active.is_(True)).order_by(BankAccount.id))
-    text = f"✅ سفارش {order.order_no} ثبت شد.\nمبلغ دقیق: {fa_num(order.total_amount)} تومان\n\n"
-    if account:
-        if account.card_number:
-            text += f"💳 شماره کارت:\n{account.card_number}\n"
-        if account.holder_name:
-            text += f"به نام: {account.holder_name}\n"
-        if account.iban:
-            text += f"شبا: {account.iban}\n"
-    text += "\nپس از واریز، تصویر فیش را همین‌جا ارسال کنید."
-    await cb.message.answer(text)
+    text, markup = payment_text_and_markup(order, account)
+    await cb.message.answer(text, reply_markup=markup, parse_mode="HTML")
     await cb.answer()
+    # محصولی که موجودی‌اش تمام شد، در کانال «ناموجود» نشان داده شود.
+    for pid in getattr(order, "depleted_product_ids", []) or []:
+        try:
+            await sync_product_post(cb.bot, pid)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------- BUY FLOW (channel button / product card) ----------------
+
+def clamp_qty(qty: int, product) -> int:
+    qty = max(1, min(int(qty), MAX_BUY_QTY))
+    if product.stock_quantity is not None and product.stock_quantity > 0:
+        qty = min(qty, int(product.stock_quantity))
+    return qty
+
+
+async def buy_card(session, product, user, qty: int):
+    unit = await get_price_for_user(session, product, qty, user)
+    has_tier = await session.scalar(select(PriceTier.id).where(PriceTier.product_id == product.id).limit(1))
+    retail = product.base_price or 0
+    wholesale = product.wholesale_price or 0
+    lines = [f"🛒 {product.name}", f"کد: {product.internal_sku}", ""]
+    if customer_type_of(user) == WHOLESALE and wholesale:
+        lines.append(f"💰 قیمت شما (عمده): {fa_num(wholesale)} تومان")
+    else:
+        lines.append(f"💰 ۱ تا {fa_num(RETAIL_MAX_QTY)} عدد (قیمت خرده): {fa_num(retail)} تومان")
+        if wholesale and wholesale != retail:
+            lines.append(f"📦 بیش از {fa_num(RETAIL_MAX_QTY)} عدد (قیمت عمده): {fa_num(wholesale)} تومان")
+    if has_tier:
+        lines.append("🎁 برای تعداد بالا، قیمت پلکانی هم اعمال می‌شود.")
+    if product.stock_quantity is not None:
+        lines.append(f"موجودی: {fa_num(product.stock_quantity)}")
+    lines += [
+        "",
+        f"🔢 تعداد: {fa_num(qty)}",
+        f"قیمت واحد: {fa_num(unit)} تومان",
+        f"💵 جمع: {fa_num(unit * qty)} تومان",
+        "",
+        "تعداد را انتخاب کنید و «افزودن به سبد خرید» را بزنید.",
+    ]
+    pid = product.id
+    quick = [1, 3, 5, 6, 10, 20]
+    rows = [
+        [
+            InlineKeyboardButton(text="➖", callback_data=f"buyq:{pid}:{max(1, qty - 1)}"),
+            InlineKeyboardButton(text=f"{fa_num(qty)} عدد", callback_data="buynoop"),
+            InlineKeyboardButton(text="➕", callback_data=f"buyq:{pid}:{qty + 1}"),
+        ],
+        [InlineKeyboardButton(text=fa_num(n), callback_data=f"buyq:{pid}:{n}") for n in quick[:3]],
+        [InlineKeyboardButton(text=fa_num(n), callback_data=f"buyq:{pid}:{n}") for n in quick[3:]],
+        [InlineKeyboardButton(text="✏️ تعداد دلخواه", callback_data=f"buycustom:{pid}")],
+        [InlineKeyboardButton(text="✅ افزودن به سبد خرید", callback_data=f"buyadd:{pid}:{qty}")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def open_buy(target, tg_id: int, pid: int, qty: int = 1, edit: bool = False):
+    """Show the quantity picker for one product (from the channel button or a card)."""
+    async with SessionLocal() as session:
+        user = await allowed_user(target, tg_id, session)
+        if not user:
+            return False
+        product = await session.get(Product, pid)
+        if not is_available(product) or not await product_visible(session, product):
+            await target.answer("این محصول در حال حاضر موجود نیست.")
+            return False
+        qty = clamp_qty(qty, product)
+        text, markup = await buy_card(session, product, user, qty)
+    if edit:
+        try:
+            await target.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+    else:
+        await target.answer(text, reply_markup=markup)
+    return True
+
+
+def parse_buy_data(data: str, parts: int):
+    try:
+        values = [int(x) for x in data.split(":")[1:]]
+    except ValueError:
+        return None
+    if len(values) != parts or any(v < 0 for v in values):
+        return None
+    return values
+
+
+@router.callback_query(F.data.startswith("buy:"))
+async def buy_open(cb: CallbackQuery, state: FSMContext):
+    values = parse_buy_data(cb.data, 1)
+    if not values:
+        return await cb.answer("درخواست نامعتبر است.", show_alert=True)
+    await state.set_state(None)
+    await open_buy(cb.message, cb.from_user.id, values[0])
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("buyq:"))
+async def buy_qty_change(cb: CallbackQuery):
+    values = parse_buy_data(cb.data, 2)
+    if not values:
+        return await cb.answer("درخواست نامعتبر است.", show_alert=True)
+    pid, qty = values
+    await open_buy(cb.message, cb.from_user.id, pid, qty, edit=True)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "buynoop")
+async def buy_noop(cb: CallbackQuery):
+    await cb.answer("با ➕ و ➖ یا دکمه‌های عدد، تعداد را تغییر دهید.")
+
+
+@router.callback_query(F.data.startswith("buycustom:"))
+async def buy_custom(cb: CallbackQuery, state: FSMContext):
+    values = parse_buy_data(cb.data, 1)
+    if not values:
+        return await cb.answer("درخواست نامعتبر است.", show_alert=True)
+    await state.set_state(BuyQty.qty)
+    await state.update_data(buy_product_id=values[0])
+    await cb.message.answer("تعداد موردنظر را به عدد ارسال کنید. مثال: ۱۲")
+    await cb.answer()
+
+
+@router.message(BuyQty.qty)
+async def buy_custom_qty(message: Message, state: FSMContext):
+    raw = normalize_digits(message.text or "").replace(",", "").replace("٬", "").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= MAX_BUY_QTY:
+        return await message.answer("تعداد معتبر نیست؛ یک عدد بزرگ‌تر از صفر بفرستید.")
+    data = await state.get_data()
+    pid = data.get("buy_product_id")
+    async with SessionLocal() as session:
+        product = await session.get(Product, pid) if pid else None
+        if product and product.stock_quantity is not None and int(raw) > product.stock_quantity:
+            return await message.answer(
+                f"موجودی این محصول {fa_num(product.stock_quantity)} عدد است؛ عدد کمتری بفرستید."
+            )
+    await state.set_state(None)
+    if pid:
+        await open_buy(message, message.from_user.id, int(pid), int(raw))
+
+
+async def cart_summary(session, user):
+    cart = await get_or_create_cart(session, user.id)
+    items = (await session.execute(select(CartItem).where(CartItem.cart_id == cart.id))).scalars().all()
+    lines, total = [], 0
+    for item in items:
+        p = await session.get(Product, item.product_id)
+        if not p:
+            continue
+        unit = await get_price_for_user(session, p, item.quantity, user)
+        total += unit * item.quantity
+        lines.append(f"• {p.name}\n  {fa_num(item.quantity)} × {fa_num(unit)} = {fa_num(unit * item.quantity)} تومان")
+    text = "🧺 سبد خرید شما\n\n" + ("\n".join(lines) or "سبد خالی است.") + f"\n\n💰 جمع کل: {fa_num(total)} تومان"
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛍 انتخاب محصول دیگر", callback_data="menu:products")],
+        [InlineKeyboardButton(text="✏️ ویرایش سبد", callback_data="menu:cart")],
+        [InlineKeyboardButton(text="💳 پرداخت", callback_data="checkout")],
+    ])
+    return text, markup
+
+
+@router.callback_query(F.data.startswith("buyadd:"))
+async def buy_add(cb: CallbackQuery, state: FSMContext):
+    values = parse_buy_data(cb.data, 2)
+    if not values or values[1] < 1:
+        return await cb.answer("درخواست نامعتبر است.", show_alert=True)
+    pid, qty = values
+    async with SessionLocal() as session:
+        user = await allowed_user(cb.message, cb.from_user.id, session)
+        if not user:
+            return await cb.answer()
+        product = await session.get(Product, pid)
+        if not is_available(product) or not await product_visible(session, product):
+            return await cb.answer("این محصول در حال حاضر موجود نیست.", show_alert=True)
+        if product.stock_quantity is not None and qty > product.stock_quantity:
+            return await cb.answer("تعداد از موجودی محصول بیشتر است.", show_alert=True)
+        cart = await get_or_create_cart(session, user.id)
+        await session.execute(select(Cart).where(Cart.id == cart.id).with_for_update())
+        item = await session.scalar(select(CartItem).where(CartItem.cart_id == cart.id, CartItem.product_id == pid))
+        if item:
+            item.quantity = qty
+        else:
+            session.add(CartItem(cart_id=cart.id, product_id=pid, quantity=qty))
+        await session.commit()
+        name = product.name
+        text, markup = await cart_summary(session, user)
+    await state.set_state(None)
+    try:
+        await cb.message.edit_text(f"✅ {fa_num(qty)} عدد «{name}» در سبد خرید قرار گرفت.")
+    except TelegramBadRequest:
+        pass
+    await cb.message.answer(text, reply_markup=markup)
+    await cb.answer("به سبد اضافه شد.")
 
 
 @router.message(Command("orders"))

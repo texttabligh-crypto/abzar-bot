@@ -7,7 +7,7 @@
 #     bash install.sh
 #
 #  اگر می‌خواهید مسیر پروژه را خودتان بدهید:
-#     bash install.sh /opt/trading-bot-v1
+#     bash install.sh /opt/trading-bot
 #
 #  این اسکریپت:
 #   • Docker و Docker Compose را بررسی می‌کند
@@ -19,7 +19,8 @@
 set -euo pipefail
 
 REPO_ZIP="https://codeload.github.com/texttabligh-crypto/abzar-bot/zip/refs/heads/main"
-DEFAULT_DIR="/opt/trading-bot-v1"
+# همان مسیری که استقرار خودکار GitHub (ops/github-deploy.sh) استفاده می‌کند.
+DEFAULT_DIR="/opt/trading-bot"
 DRY_RUN="0"
 for arg in "$@"; do
   case "$arg" in
@@ -65,7 +66,7 @@ elif [ -f "./docker-compose.yml" ] && [ -f "./main.py" ]; then
 else
   # جستجوی نصب قبلی در مسیرهای رایج
   DEST=""
-  for candidate in "$DEFAULT_DIR" /opt/abzar-bot /opt/tradingbot \
+  for candidate in "$DEFAULT_DIR" /opt/trading-bot-v1 /opt/abzar-bot /opt/tradingbot \
                    "$HOME/trading-bot-v1" /root/trading-bot-v1 \
                    $(ls -d /opt/*/ 2>/dev/null); do
     if [ -f "${candidate%/}/docker-compose.yml" ] && [ -f "${candidate%/}/main.py" ]; then

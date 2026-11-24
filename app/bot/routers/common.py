@@ -219,6 +219,18 @@ async def start(message: Message, state: FSMContext):
             await session.refresh(user)
 
     await state.clear()
+    if payload and payload.startswith("buy_"):
+        raw_id = payload.removeprefix("buy_")
+        if not raw_id.isascii() or not raw_id.isdigit() or len(raw_id) > 19 or not 0 < int(raw_id) < 2**63:
+            return await message.answer("لینک خرید نامعتبر است.")
+        status = account_state(user, await is_admin_user(message.from_user.id))
+        if status == INCOMPLETE:
+            # بعد از تکمیل ثبت‌نام خرد، مستقیم همین محصول باز می‌شود.
+            await state.update_data(pending_buy=int(raw_id))
+            await message.answer("برای خرید، اول ثبت‌نام کوتاه را کامل کنید 👇", reply_markup=ReplyKeyboardRemove())
+            return await ask_customer_type(message, state)
+        from app.bot.routers.customer import open_buy
+        return await open_buy(message, message.from_user.id, int(raw_id))
     if payload and payload.startswith("product_"):
         from app.bot.routers.customer import allowed_user, compact_product
         from app.models import Product
@@ -229,8 +241,9 @@ async def start(message: Message, state: FSMContext):
             customer = await allowed_user(message, message.from_user.id, session)
             if not customer:
                 return
+            from app.services.catalog import product_visible
             product = await session.get(Product, int(raw_id))
-            if not product or not product.is_active:
+            if not await product_visible(session, product):
                 return await message.answer("این محصول دیگر در دسترس نیست.")
         return await compact_product(message, product, customer)
     admin_enabled = await is_admin_user(message.from_user.id)
@@ -310,8 +323,12 @@ async def save_retail_phone(message: Message, state: FSMContext, phone: str):
             user.last_name = message.from_user.last_name
         await session.commit()
         await session.refresh(user)
+    pending_buy = (await state.get_data()).get("pending_buy")
     await state.clear()
     await message.answer("✅ ثبت‌نام شما کامل شد.", reply_markup=ReplyKeyboardRemove())
+    if pending_buy:
+        from app.bot.routers.customer import open_buy
+        return await open_buy(message, message.from_user.id, int(pending_buy))
     await send_main_menu(message, user, False)
 
 

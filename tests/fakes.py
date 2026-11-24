@@ -38,10 +38,10 @@ class FakeBot:
         self.sent.append((chat_id, "album", None))
         return [self]
 
-    async def edit_message_caption(self, chat_id, message_id, caption):
+    async def edit_message_caption(self, chat_id, message_id, caption, **kwargs):
         return True
 
-    async def edit_message_text(self, chat_id, message_id, text):
+    async def edit_message_text(self, chat_id, message_id, text, **kwargs):
         return True
 
 

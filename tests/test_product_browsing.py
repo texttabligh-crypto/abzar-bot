@@ -59,7 +59,7 @@ async def test_product_deep_link_shows_only_selected_product(db):
     message = FakeMessage(f'/start product_{pid}', user=FakeUser(id=7000))
     await common.start(message, make_state(7000))
     assert len(message.answers) == 1 and name in message.answers[0]
-    assert f'addcart:{pid}' in callbacks(message.markups[0])
+    assert f'buy:{pid}' in callbacks(message.markups[0])
     assert 'فهرست محصولات' not in message.answers[0]
 
 
@@ -71,7 +71,7 @@ async def test_product_button_only_shows_selected_product_and_rejects_inactive(d
     cb = FakeCallback(f'showprod:{pid}', user=FakeUser(id=7000))
     await customer.show_product(cb)
     assert len(cb.message.answers) == 1
-    assert f'addcart:{pid}' in callbacks(cb.message.markups[0])
+    assert f'buy:{pid}' in callbacks(cb.message.markups[0])
     async with db() as s:
         (await s.get(Product, pid)).is_active = False
         await s.commit()

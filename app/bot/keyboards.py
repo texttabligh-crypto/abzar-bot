@@ -128,12 +128,12 @@ def product_list_actions(product_id: int, post_url: str | None):
     rows = []
     if post_url:
         rows.append([InlineKeyboardButton(text="🔗 مشاهده محصول در کانال", url=post_url)])
-    rows.append([InlineKeyboardButton(text="🛒 افزودن به سبد", callback_data=f"addcart:{product_id}")])
+    rows.append([InlineKeyboardButton(text="🛒 انتخاب تعداد و خرید", callback_data=f"buy:{product_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def product_actions(product_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 انتخاب تعداد و افزودن", callback_data=f"addcart:{product_id}")]
+        [InlineKeyboardButton(text="🛒 انتخاب تعداد و خرید", callback_data=f"buy:{product_id}")]
     ])
 
 def cart_actions(item_id: int):
@@ -181,19 +181,18 @@ def confirm_import(batch_id=None):
         rows.insert(0, [InlineKeyboardButton(text="⚠️ بررسی موارد مشکوک", callback_data=f"import:review:{batch_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def order_status_menu(order_id: int):
-    statuses = [
-        ("CONFIRMED","تأیید شده"),
-        ("PREPARING","در حال آماده‌سازی"),
-        ("READY","آماده"),
-        ("SHIPPED","ارسال شده"),
-        ("DELIVERED","تکمیل شده"),
-        ("CANCELLED","لغو شده"),
+def order_status_menu(order_id: int, current_status: str | None = None):
+    """Only offer the transitions allowed from the current status."""
+    from app.utils import allowed_order_transitions, order_status_label
+    if current_status is None:
+        codes = ["CONFIRMED", "PREPARING", "READY", "SHIPPED", "DELIVERED", "CANCELLED"]
+    else:
+        codes = allowed_order_transitions(current_status)
+    rows = [
+        [InlineKeyboardButton(text=order_status_label(code), callback_data=f"orderstatus:{order_id}:{code}")]
+        for code in codes
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=title, callback_data=f"orderstatus:{order_id}:{code}")]
-        for code, title in statuses
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def wholesale_review_keyboard(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[

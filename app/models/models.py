@@ -219,6 +219,9 @@ class Payment(Base):
     reviewed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rejection_reason: Mapped[str | None] = mapped_column(Text)
+    # {"caption": str, "messages": [[chat_id, message_id], ...]} — the receipt copy
+    # each manager got, so the first decision can close it for everyone.
+    review_messages: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
 
@@ -285,6 +288,10 @@ class ProductChannelPost(Base):
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
     channel_id: Mapped[int] = mapped_column(ForeignKey("publish_channels.id", ondelete="CASCADE"))
     message_id: Mapped[int] = mapped_column(BigInteger)
+    # Albums cannot carry inline buttons, so the buy button lives in a
+    # separate message right after the album.
+    button_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    album_size: Mapped[int | None] = mapped_column(Integer)
     post_url: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
