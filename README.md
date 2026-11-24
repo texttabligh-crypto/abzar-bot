@@ -1,4 +1,4 @@
-# Abzar Bot (V2.4)
+# Abzar Bot (V2.5)
 
 ربات تلگرامی مدیریت کاتالوگ، قیمت، سفارش و کانال برای شرکت بازرگانی.
 
@@ -55,7 +55,7 @@ build بدون کش و ری‌استارت را انجام می‌دهد. اگر
 گزینه‌ها:
 
 ```bash
-bash install.sh /opt/trading-bot-v1     # مسیر دلخواه
+bash install.sh /opt/trading-bot        # مسیر دلخواه (پیش‌فرض همین است)
 bash install.sh --dry-run               # فقط نمایش مراحل، بدون تغییر
 ```
 

@@ -1,11 +1,16 @@
 """نسخه‌ی برنامه — برای اینکه از داخل تلگرام بتوانیم مطمئن شویم کدام نسخه روی سرور اجرا می‌شود."""
 
-APP_VERSION = "2.4.4"
-BUILD_DATE = "2026-10-28"
+APP_VERSION = "2.5.0"
+BUILD_DATE = "2026-11-24"
 
 # قابلیت‌هایی که فقط در این نسخه وجود دارند. اگر روی سرور نباشند،
 # یعنی کد جدید مستقر نشده است.
 FEATURES = [
+    ("دکمه خرید زیر پست‌های کانال", "app/services/publishing.py"),
+    ("خرد تا ۵ عدد / عمده بیش از ۵ عدد", "app/services/catalog.py"),
+    ("کپی مبلغ و شماره کارت در پرداخت", "app/bot/routers/customer.py"),
+    ("تأیید فیش با اولین مدیر", "app/bot/routers/payments.py"),
+    ("افزودن چندانتخابی محصول به برند", "app/bot/routers/admin.py"),
     ("تفکیک مشتری خرد و عمده", "app/services/catalog.py"),
     ("دسته‌بندی درختی + زیرمجموعه", "app/services/catalog.py"),
     ("اتصال به کانال + فوتر", "app/services/publishing.py"),

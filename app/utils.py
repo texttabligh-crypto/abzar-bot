@@ -20,6 +20,24 @@ ORDER_STATUS_LABELS = {
     "CANCELLED": "لغو شده",
 }
 
+# وضعیت‌هایی که مدیر می‌تواند از هر وضعیت به آن‌ها برود.
+# (PAYMENT_REVIEW و CONFIRMED از مسیر فیش پرداخت تنظیم می‌شوند.)
+ORDER_TRANSITIONS = {
+    "WAITING_PAYMENT": ["CANCELLED"],
+    "PAYMENT_REVIEW": ["WAITING_PAYMENT", "CANCELLED"],
+    "CONFIRMED": ["PREPARING", "READY", "SHIPPED", "CANCELLED"],
+    "PREPARING": ["READY", "SHIPPED", "CANCELLED"],
+    "READY": ["SHIPPED", "DELIVERED", "CANCELLED"],
+    "SHIPPED": ["DELIVERED"],
+    "DELIVERED": [],
+    "CANCELLED": [],
+}
+
+
+def allowed_order_transitions(current: str | None) -> list[str]:
+    return list(ORDER_TRANSITIONS.get((current or "").strip(), []))
+
+
 CUSTOMER_TYPE_LABELS = {"retail": "خرد", "wholesale": "عمده"}
 
 

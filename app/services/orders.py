@@ -1,5 +1,7 @@
 from decimal import Decimal
-from sqlalchemy import select, func
+from uuid import uuid4
+
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Cart, CartItem, Product, Order, OrderItem, User
@@ -51,9 +53,10 @@ async def create_order_from_cart(session: AsyncSession, user_id: int) -> Order |
         if item.quantity < 1 or (p.stock_quantity is not None and item.quantity > p.stock_quantity):
             raise CheckoutError("موجودی محصول برای تعداد انتخاب‌شده کافی نیست.")
 
-    last_id = await session.scalar(select(func.max(Order.id))) or 0
     order = Order(
-        order_no=f"ORD-{100001 + int(last_id)}",
+        # Placeholder; the final number is derived from the row id below so
+        # two simultaneous checkouts can never get the same number.
+        order_no=f"TMP-{uuid4().hex[:20]}",
         user_id=user_id,
         status="WAITING_PAYMENT",
         total_amount=0,
@@ -64,9 +67,11 @@ async def create_order_from_cart(session: AsyncSession, user_id: int) -> Order |
     )
     session.add(order)
     await session.flush()
+    order.order_no = f"ORD-{100000 + int(order.id)}"
 
     total = Decimal("0")
     kept: list[CartItem] = []
+    depleted: list[int] = []
     for item in items:
         product = await session.get(Product, item.product_id)
         if not product:
@@ -75,6 +80,12 @@ async def create_order_from_cart(session: AsyncSession, user_id: int) -> Order |
             await session.delete(item)
             continue
         unit = await get_price_for_user(session, product, item.quantity, customer)
+        # Reserve stock now; it is given back if the order is cancelled.
+        if product.stock_quantity is not None:
+            product.stock_quantity = int(product.stock_quantity) - int(item.quantity)
+            if product.stock_quantity <= 0:
+                product.stock_quantity = 0
+                depleted.append(product.id)
         line = unit * item.quantity
         total += line
         kept.append(item)
@@ -95,4 +106,27 @@ async def create_order_from_cart(session: AsyncSession, user_id: int) -> Order |
         await session.delete(item)
     await session.commit()
     await session.refresh(order)
+    # Plain attribute (not a column): products whose channel post must now
+    # show «ناموجود».
+    order.depleted_product_ids = depleted
     return order
+
+
+async def restore_order_stock(session: AsyncSession, order: Order) -> list[int]:
+    """Give reserved stock back (used when an order is cancelled)."""
+    items = (await session.execute(select(OrderItem).where(OrderItem.order_id == order.id))).scalars().all()
+    ids = sorted({i.product_id for i in items if i.product_id})
+    if not ids:
+        return []
+    products = {
+        p.id: p for p in (await session.execute(
+            select(Product).where(Product.id.in_(ids)).order_by(Product.id).with_for_update()
+        )).scalars().all()
+    }
+    restored = []
+    for item in items:
+        p = products.get(item.product_id)
+        if p is not None and p.stock_quantity is not None:
+            p.stock_quantity = int(p.stock_quantity) + int(item.quantity)
+            restored.append(p.id)
+    return sorted(set(restored))

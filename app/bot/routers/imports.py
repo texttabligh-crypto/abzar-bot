@@ -16,7 +16,7 @@ from app.models import (
     Brand, SupplierMapping, SystemSetting
 )
 from app.services.auth import has_permission, guard
-from app.services.catalog import next_sku, set_product_price
+from app.services.catalog import temp_sku, assign_sku, set_product_price
 from app.services.excel_import import parse_workbook
 from app.bot.keyboards import confirm_import
 from app.utils import norm_text, normalize_digits
@@ -353,11 +353,11 @@ async def import_apply(cb: CallbackQuery, state: FSMContext):
                 if values["wholesale_price"] == 0:
                     values["wholesale_price"] = values["base_price"]
                 product = Product(
-                    internal_sku=await next_sku(session), name=name,
+                    internal_sku=temp_sku(), name=name,
                     brand_id=brand_id, **values
                 )
                 session.add(product)
-                await session.flush()
+                await assign_sku(session, product)
                 created += 1
 
             if supplier_id:

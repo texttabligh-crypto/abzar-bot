@@ -1,5 +1,7 @@
 from decimal import Decimal
-from sqlalchemy import select, func
+from uuid import uuid4
+
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Product, PriceTier, PriceHistory, Category, User
@@ -32,9 +34,33 @@ def customer_type_of(user: User | None) -> str:
     return WHOLESALE if getattr(user, "customer_type", None) == WHOLESALE else RETAIL
 
 
+# تا این تعداد، مشتری خرد با قیمت خرده حساب می‌شود؛ بیشتر از آن با قیمت عمده.
+RETAIL_MAX_QTY = 5
+
+
 async def next_sku(session: AsyncSession) -> str:
+    """Legacy helper (race-prone). New code: temp_sku() + assign_sku() after flush."""
     mx = await session.scalar(select(func.max(Product.id)))
     return f"PRD-{100001 + int(mx or 0)}"
+
+
+def temp_sku() -> str:
+    """Unique placeholder until the product id exists."""
+    return f"TMP-{uuid4().hex[:20]}"
+
+
+def sku_for_id(product_id: int) -> str:
+    # Same numbering as before (PRD-100001 for id 1), but derived from the
+    # row's own id so two concurrent creations never collide.
+    return f"PRD-{100000 + int(product_id)}"
+
+
+async def assign_sku(session: AsyncSession, product: Product) -> str:
+    """Flush to get the id, then give the product its final SKU."""
+    await session.flush()
+    product.internal_sku = sku_for_id(product.id)
+    await session.flush()
+    return product.internal_sku
 
 
 async def find_tier(session: AsyncSession, product: Product, qty: int) -> PriceTier | None:
@@ -47,24 +73,27 @@ async def find_tier(session: AsyncSession, product: Product, qty: int) -> PriceT
     )
 
 
-def base_price_for(user: User | None, product: Product) -> Decimal:
-    """Price used when no quantity tier matches."""
-    if customer_type_of(user) == WHOLESALE:
-        wholesale = Decimal(product.wholesale_price or 0)
-        if wholesale > 0:
-            return wholesale
+def base_price_for(user: User | None, product: Product, qty: int = 1) -> Decimal:
+    """Price used when no quantity tier matches.
+
+    - approved wholesale accounts always pay the wholesale price;
+    - everyone else pays retail up to RETAIL_MAX_QTY and wholesale above it.
+    A zero wholesale price falls back to retail (never sell at zero).
+    """
+    wholesale = Decimal(product.wholesale_price or 0)
+    if wholesale > 0 and (customer_type_of(user) == WHOLESALE or int(qty or 0) > RETAIL_MAX_QTY):
+        return wholesale
     return Decimal(product.base_price or 0)
 
 
 async def get_price_for_user(
     session: AsyncSession, product: Product, qty: int, user: User | None = None
 ) -> Decimal:
-    """Tier price wins; otherwise wholesale customers pay the wholesale price
-    and retail customers pay the retail price (legacy `base_price`)."""
+    """Tier price wins; otherwise see base_price_for (retail ≤5, wholesale >5)."""
     tier = await find_tier(session, product, qty)
     if tier:
         return Decimal(tier.unit_price)
-    return base_price_for(user, product)
+    return base_price_for(user, product, qty)
 
 
 async def get_price_for_qty(session: AsyncSession, product: Product, qty: int) -> Decimal:
@@ -170,3 +199,44 @@ async def descendant_ids(session: AsyncSession, category_id: int) -> list[int]:
         out.append(cid)
         stack.extend(children.get(cid, []))
     return out
+
+
+async def hidden_category_ids(session: AsyncSession) -> set[int]:
+    """Inactive categories plus all of their descendants."""
+    rows = (await session.execute(select(Category.id, Category.parent_id, Category.is_active))).all()
+    children: dict[int, list[int]] = {}
+    for cid, parent_id, _active in rows:
+        if parent_id is not None:
+            children.setdefault(parent_id, []).append(cid)
+    hidden: set[int] = set()
+    stack = [cid for cid, _p, active in rows if not active]
+    while stack:
+        cid = stack.pop()
+        if cid in hidden:
+            continue
+        hidden.add(cid)
+        stack.extend(children.get(cid, []))
+    return hidden
+
+
+def visible_products_filter(hidden: set[int]):
+    """SQL condition that hides products sitting in a disabled category branch."""
+    if not hidden:
+        return None
+    return or_(Product.category_id.is_(None), Product.category_id.not_in(sorted(hidden)))
+
+
+def is_available(product: Product | None) -> bool:
+    return bool(
+        product and product.is_active
+        and product.stock_status not in {"unavailable", "out_of_stock"}
+        and product.stock_quantity != 0
+    )
+
+
+async def product_visible(session: AsyncSession, product: Product | None) -> bool:
+    if not product or not product.is_active:
+        return False
+    if product.category_id is None:
+        return True
+    return product.category_id not in await hidden_category_ids(session)

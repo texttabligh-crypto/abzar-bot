@@ -9,7 +9,17 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
 esac
 exec 9>/run/lock/abzar-deploy.lock
 flock -n 9 || { echo 'Another deployment is running.' >&2; exit 1; }
-cd /opt/trading-bot
+# One code path for every install: the old docs used /opt/trading-bot-v1,
+# this hook used /opt/trading-bot. Use whichever git checkout exists.
+APP_DIR=""
+for candidate in /opt/trading-bot /opt/trading-bot-v1; do
+  if [[ -d "$candidate/.git" && -f "$candidate/docker-compose.yml" ]]; then
+    APP_DIR="$candidate"; break
+  fi
+done
+[[ -n "$APP_DIR" ]] || { echo 'No git checkout found in /opt/trading-bot or /opt/trading-bot-v1.' >&2; exit 1; }
+echo "Deploying in $APP_DIR"
+cd "$APP_DIR"
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || {
   echo 'Tracked local changes found; refusing to overwrite.' >&2; exit 1;
 }

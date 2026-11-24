@@ -21,12 +21,14 @@ from app.services.auth import has_permission, guard
 from app.services.catalog import (
     next_sku, set_price, set_product_price, PRICE_LABELS, PRICE_ATTRS,
     category_tree, category_label, category_path, descendant_ids, WHOLESALE,
+    temp_sku, assign_sku,
 )
+from app.services.orders import restore_order_stock
 from app.services.audit import add_audit
-from app.utils import normalize_digits, fa_num, order_status_label, parse_int
+from app.utils import normalize_digits, fa_num, order_status_label, parse_int, allowed_order_transitions
 from app.version import short_version
 from app.services.publishing import (
-    publish_product, publish_many, sync_product_post,
+    publish_product, publish_many, sync_product_post, delete_product_posts,
     connect_channel, auto_publish_if_enabled, setting_value, set_setting_value,
     FOOTER_KEY, AUTO_PUBLISH_KEY,
 )
@@ -135,6 +137,10 @@ class ChannelSetup(StatesGroup):
     username = State()
 
 
+class BrandAssign(StatesGroup):
+    search = State()
+
+
 class PublishFlow(StatesGroup):
     single_query = State()
     price_min = State()
@@ -201,9 +207,8 @@ async def finalize_new_product(target, tg_id: int, state: FSMContext):
     tiers = list(data.get("tiers") or [])
     async with SessionLocal() as session:
         actor = await session.scalar(select(User).where(User.telegram_id == tg_id))
-        sku = await next_sku(session)
         product = Product(
-            internal_sku=sku,
+            internal_sku=temp_sku(),
             name=data["name"],
             brand_id=data.get("brand_id"),
             category_id=data.get("category_id"),
@@ -213,7 +218,7 @@ async def finalize_new_product(target, tg_id: int, state: FSMContext):
             telegram_file_id=image_ids[0] if image_ids else None,
         )
         session.add(product)
-        await session.flush()
+        sku = await assign_sku(session, product)
         for idx, file_id in enumerate(image_ids):
             session.add(ProductImage(product_id=product.id, telegram_file_id=file_id, sort_order=idx))
         for tier in tiers:
@@ -547,7 +552,9 @@ async def edit_product_start(cb: CallbackQuery, state: FSMContext):
 
 @router.message(EditProduct.query)
 async def edit_product_query(message: Message, state: FSMContext):
-    q = message.text.strip()
+    q = (message.text or "").strip()
+    if not q:
+        return await message.answer("نام یا کد محصول را به‌صورت متن ارسال کنید.")
     async with SessionLocal() as session:
         rows = (await session.execute(select(Product).where(
             (Product.name.ilike(f"%{q}%")) | (Product.internal_sku.ilike(f"%{q}%"))
@@ -930,16 +937,18 @@ async def edit_photo(message: Message, state: FSMContext):
 async def edit_value(message: Message, state: FSMContext):
     data = await state.get_data()
     field = data["field"]
+    if field in {"name", "description"} and not (message.text or "").strip():
+        return await message.answer("لطفاً متن ارسال کنید.")
 
     async with SessionLocal() as session:
         p = await session.get(Product, data["product_id"])
         actor = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
 
         if field == "name":
-            p.name = message.text.strip()
+            p.name = (message.text or "").strip()
 
         elif field == "description":
-            p.description = message.text.strip()
+            p.description = (message.text or "").strip()
 
         elif field.startswith("price_"):
             price_type = field.split("_", 1)[1]
@@ -1012,11 +1021,22 @@ async def edit_value(message: Message, state: FSMContext):
 async def edit_toggle(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     async with SessionLocal() as session:
-        p = await session.get(Product, data["product_id"])
+        p = await session.get(Product, data.get("product_id")) if data.get("product_id") else None
+        if not p:
+            return await cb.answer("دوباره محصول را برای ویرایش انتخاب کنید.", show_alert=True)
         p.is_active = not p.is_active
         await session.commit()
+        pid, active = p.id, p.is_active
     await state.clear()
-    await cb.message.answer(f"وضعیت محصول: {'فعال' if p.is_active else 'غیرفعال'}")
+    # پست کانال: غیرفعال ← «ناموجود» و بدون دکمه خرید؛ فعال ← برگشت دکمه.
+    try:
+        await sync_product_post(cb.bot, pid)
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.message.answer(
+        f"وضعیت محصول: {'فعال' if active else 'غیرفعال'}\n"
+        + ("پست کانال دوباره قابل خرید شد." if active else "پست کانال به «ناموجود» تغییر کرد و دکمه خرید برداشته شد.")
+    )
     await cb.answer()
 
 
@@ -1057,6 +1077,7 @@ async def brand_view(cb: CallbackQuery):
             return await cb.answer("برند پیدا نشد.", show_alert=True)
         count = await session.scalar(select(func.count(Product.id)).where(Product.brand_id == bid))
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 افزودن محصول به این برند (چندانتخابی)", callback_data=f"brandadd:start:{bid}")],
         [InlineKeyboardButton(text="✏️ تغییر نام", callback_data=f"brand:rename:{bid}")],
         [InlineKeyboardButton(
             text="⛔ غیرفعال کردن" if brand.is_active else "✅ فعال کردن",
@@ -1315,7 +1336,7 @@ async def category_toggle(cb: CallbackQuery):
         name = cat.name
     await cb.message.answer(
         f"دسته‌بندی «{name}» {'فعال' if status else 'غیرفعال'} شد."
-        + ("" if status else "\nمحصولات این دسته در لیست مشتری نمایش داده نمی‌شوند.")
+        + ("" if status else "\nمحصولات این دسته و زیرمجموعه‌هایش در فهرست، جستجو و لیست قیمت مشتری نمایش داده نمی‌شوند.")
     )
     await cb.answer()
 
@@ -1382,9 +1403,8 @@ async def category_product_wholesale(message: Message, state: FSMContext):
             return await message.answer("قیمت نامعتبر است؛ مبلغ یا - بفرستید.")
     async with SessionLocal() as session:
         actor = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
-        sku = await next_sku(session)
         product = Product(
-            internal_sku=sku,
+            internal_sku=temp_sku(),
             name=data["product_name"],
             category_id=data.get("category_id"),
             purchase_price=data["purchase_price"],
@@ -1392,7 +1412,7 @@ async def category_product_wholesale(message: Message, state: FSMContext):
             wholesale_price=wholesale,
         )
         session.add(product)
-        await session.flush()
+        sku = await assign_sku(session, product)
         product_id = product.id
         await add_audit(session, actor.id if actor else None, "product.create", "product", product_id, {
             "sku": sku, "name": product.name, "category_id": product.category_id,
@@ -1581,7 +1601,7 @@ async def admin_add(cb: CallbackQuery, state: FSMContext):
 
 @router.message(AddAdmin.telegram_id)
 async def admin_add_id(message: Message, state: FSMContext):
-    raw = normalize_digits(message.text.strip())
+    raw = normalize_digits((message.text or "").strip())
     if not raw.isdigit():
         return await message.answer("ID نامعتبر است.")
     tg_id = int(raw)
@@ -1637,6 +1657,8 @@ async def bank_add(cb: CallbackQuery, state: FSMContext):
 
 @router.message(AddBank.title)
 async def bank_title(message: Message, state: FSMContext):
+    if not (message.text or "").strip():
+        return await message.answer("عنوان حساب را به‌صورت متن ارسال کنید.")
     await state.update_data(title=message.text.strip())
     await state.set_state(AddBank.card)
     await message.answer("شماره کارت را ارسال کنید.")
@@ -1644,6 +1666,8 @@ async def bank_title(message: Message, state: FSMContext):
 
 @router.message(AddBank.card)
 async def bank_card(message: Message, state: FSMContext):
+    if not (message.text or "").strip():
+        return await message.answer("شماره کارت را به‌صورت متن ارسال کنید.")
     await state.update_data(card=message.text.strip())
     await state.set_state(AddBank.holder)
     await message.answer("نام صاحب حساب را ارسال کنید.")
@@ -1651,6 +1675,8 @@ async def bank_card(message: Message, state: FSMContext):
 
 @router.message(AddBank.holder)
 async def bank_holder(message: Message, state: FSMContext):
+    if not (message.text or "").strip():
+        return await message.answer("نام صاحب حساب را به‌صورت متن ارسال کنید.")
     await state.update_data(holder=message.text.strip())
     await state.set_state(AddBank.iban)
     await message.answer("شماره شبا را ارسال کنید یا - بفرستید.")
@@ -1658,6 +1684,8 @@ async def bank_holder(message: Message, state: FSMContext):
 
 @router.message(AddBank.iban)
 async def bank_iban(message: Message, state: FSMContext):
+    if not (message.text or "").strip():
+        return await message.answer("شماره شبا را به‌صورت متن یا - ارسال کنید.")
     data = await state.get_data()
     async with SessionLocal() as session:
         session.add(BankAccount(
@@ -1919,7 +1947,9 @@ async def publish_single_start(cb: CallbackQuery, state: FSMContext):
 
 @router.message(PublishFlow.single_query)
 async def publish_single_query(message: Message, state: FSMContext):
-    q = message.text.strip()
+    q = (message.text or "").strip()
+    if not q:
+        return await message.answer("نام یا کد محصول را به‌صورت متن ارسال کنید.")
     async with SessionLocal() as session:
         rows = (await session.execute(select(Product).where(
             Product.is_active.is_(True),
@@ -2157,6 +2187,8 @@ async def build_price_selection_markup(product_ids, selected_ids):
 @router.message(PriceChangeFlow.search)
 async def price_change_search(message: Message, state: FSMContext):
     q = (message.text or "").strip()
+    if not q:
+        return await message.answer("نام یا کد محصول را به‌صورت متن ارسال کنید.")
     async with SessionLocal() as session:
         products = (await session.execute(select(Product).where(
             Product.is_active.is_(True),
@@ -2396,7 +2428,9 @@ async def tier_start(cb: CallbackQuery, state: FSMContext):
 
 @router.message(TierFlow.product)
 async def tier_product(message: Message, state: FSMContext):
-    q = message.text.strip()
+    q = (message.text or "").strip()
+    if not q:
+        return await message.answer("نام یا کد محصول را به‌صورت متن ارسال کنید.")
     async with SessionLocal() as session:
         rows = (await session.execute(select(Product).where(
             (Product.name.ilike(f"%{q}%")) | (Product.internal_sku.ilike(f"%{q}%"))
@@ -2490,6 +2524,8 @@ async def delete_product_start(cb: CallbackQuery, state: FSMContext):
 @router.message(DeleteProductFlow.query)
 async def delete_product_query(message: Message, state: FSMContext):
     q = (message.text or "").strip()
+    if not q:
+        return await message.answer("نام یا کد محصول را به‌صورت متن ارسال کنید.")
     async with SessionLocal() as session:
         products = (await session.execute(select(Product).where(
             (Product.name.ilike(f"%{q}%")) | (Product.internal_sku.ilike(f"%{q}%"))
@@ -2532,6 +2568,12 @@ async def product_delete_apply(cb: CallbackQuery):
         return
     pid = int(cb.data.split(":")[2])
     async with SessionLocal() as session:
+        exists = await session.get(Product, pid)
+    if not exists:
+        return await cb.answer("محصول پیدا نشد.", show_alert=True)
+    # پیام‌های کانال (عکس/آلبوم + دکمه خرید) قبل از حذف محصول پاک می‌شوند.
+    removed_posts = await delete_product_posts(cb.bot, [pid])
+    async with SessionLocal() as session:
         actor = await session.scalar(select(User).where(User.telegram_id == cb.from_user.id))
         p = await session.get(Product, pid)
         if not p:
@@ -2546,7 +2588,8 @@ async def product_delete_apply(cb: CallbackQuery):
         await session.commit()
     await cb.message.answer(
         "✅ محصول کامل حذف شد." +
-        (" سابقه سفارش‌های قبلی از طریق Snapshot حفظ شده است." if used_in_orders else "")
+        (" سابقه سفارش‌های قبلی از طریق Snapshot حفظ شده است." if used_in_orders else "") +
+        (f"\n🗑 {fa_num(removed_posts)} پیام کانال هم حذف شد." if removed_posts else "")
     )
     await cb.answer()
 
@@ -2584,14 +2627,20 @@ async def order_detail(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2])
     async with SessionLocal() as session:
         o = await session.get(Order, oid)
+        if not o:
+            return await cb.answer("سفارش پیدا نشد.", show_alert=True)
         items = (await session.execute(select(OrderItem).where(OrderItem.order_id == oid))).scalars().all()
+    next_codes = allowed_order_transitions(o.status)
     text = (
-        f"سفارش: {o.order_no}\nمشتری: {o.customer_name_snapshot or '-'}\n"
+        f"سفارش: {o.order_no}\nوضعیت: {order_status_label(o.status)}\n"
+        f"مشتری: {o.customer_name_snapshot or '-'}\n"
         f"شماره: {o.customer_phone_snapshot or '-'}\nمغازه: {o.shop_name_snapshot or '-'}\n"
         f"جمع: {fa_num(o.total_amount)} تومان\n\n"
         + "\n".join(f"{i.product_name_snapshot} × {i.quantity} = {fa_num(i.line_total)}" for i in items)
     )
-    await cb.message.answer(text, reply_markup=order_status_menu(oid))
+    if not next_codes:
+        text += "\n\nاین سفارش بسته شده و وضعیتش قابل تغییر نیست."
+    await cb.message.answer(text, reply_markup=order_status_menu(oid, o.status) if next_codes else None)
     await cb.answer()
 
 @router.callback_query(F.data.startswith("orderstatus:"))
@@ -2599,18 +2648,51 @@ async def order_detail(cb: CallbackQuery):
 async def order_status_change(cb: CallbackQuery):
     if not await require(cb, "orders.manage"):
         return
-    _, oid, status = cb.data.split(":")
-    async with SessionLocal() as session:
-        o = await session.get(Order, int(oid))
-        user = await session.get(User, o.user_id)
-        o.status = status
-        session.add(AuditLog(action="order.status", entity_type="order", entity_id=str(o.id), payload={"status":status}))
-        await session.commit()
     try:
-        await cb.bot.send_message(user.telegram_id, f"وضعیت سفارش {o.order_no} به «{order_status_label(status)}» تغییر کرد.")
+        _, raw_oid, status = cb.data.split(":")
+        oid = int(raw_oid)
+    except ValueError:
+        return await cb.answer("درخواست نامعتبر است.", show_alert=True)
+    restored: list[int] = []
+    async with SessionLocal() as session:
+        actor = await session.scalar(select(User).where(User.telegram_id == cb.from_user.id))
+        o = await session.scalar(select(Order).where(Order.id == oid).with_for_update())
+        if not o:
+            return await cb.answer("سفارش پیدا نشد.", show_alert=True)
+        if status not in allowed_order_transitions(o.status):
+            return await cb.answer(
+                f"از وضعیت «{order_status_label(o.status)}» نمی‌شود به «{order_status_label(status)}» رفت.",
+                show_alert=True,
+            )
+        old_status = o.status
+        if status == "CANCELLED":
+            restored = await restore_order_stock(session, o)
+        o.status = status
+        user = await session.get(User, o.user_id)
+        session.add(AuditLog(
+            user_id=actor.id if actor else None, action="order.status",
+            entity_type="order", entity_id=str(o.id),
+            payload={"from": old_status, "to": status},
+        ))
+        await session.commit()
+        order_no = o.order_no
+        customer_tg = user.telegram_id if user else None
+    for pid in restored:
+        try:
+            await sync_product_post(cb.bot, pid)
+        except Exception:  # noqa: BLE001
+            pass
+    if customer_tg:
+        try:
+            await cb.bot.send_message(customer_tg, f"وضعیت سفارش {order_no} به «{order_status_label(status)}» تغییر کرد.")
+        except Exception:
+            pass
+    try:
+        nxt = allowed_order_transitions(status)
+        await cb.message.edit_reply_markup(reply_markup=order_status_menu(oid, status) if nxt else None)
     except Exception:
         pass
-    await cb.answer("وضعیت تغییر کرد.")
+    await cb.answer(f"وضعیت: {order_status_label(status)}" + (" — موجودی برگشت داده شد." if restored else ""))
 
 @router.callback_query(F.data == "admin:audit")
 @guard("reports.view")
@@ -3204,6 +3286,10 @@ async def system_reset_products_confirm(cb: CallbackQuery):
         actor = await session.scalar(select(User).where(User.telegram_id == cb.from_user.id))
         if not actor or not actor.is_owner:
             return await cb.answer("این گزینه فقط برای Owner است.", show_alert=True)
+        all_ids = (await session.execute(select(Product.id))).scalars().all()
+    await delete_product_posts(cb.bot, list(all_ids))
+    async with SessionLocal() as session:
+        actor = await session.scalar(select(User).where(User.telegram_id == cb.from_user.id))
         products = (await session.execute(select(Product))).scalars().all()
         deleted_count = len(products)
         historical_items = await session.scalar(select(func.count(OrderItem.id)).where(OrderItem.product_id.is_not(None)))
@@ -3247,6 +3333,8 @@ async def sys_support(cb: CallbackQuery, state: FSMContext):
 
 @router.message(SystemSettingsFlow.support)
 async def sys_support_save(message: Message, state: FSMContext):
+    if not (message.text or "").strip():
+        return await message.answer("متن پشتیبانی را به‌صورت متن ارسال کنید.")
     async with SessionLocal() as session:
         row = await session.get(SystemSetting, "support_text")
         if not row:
@@ -3335,7 +3423,7 @@ async def bank_edit(cb: CallbackQuery, state: FSMContext):
 
 @router.message(BankEditFlow.value)
 async def bank_edit_save(message: Message, state: FSMContext):
-    parts = [x.strip() for x in message.text.split("|")]
+    parts = [x.strip() for x in (message.text or "").split("|")]
     if len(parts) != 4:
         return await message.answer("قالب صحیح نیست.")
     data = await state.get_data()
@@ -3382,4 +3470,197 @@ async def edit_metadata_save(cb: CallbackQuery, state: FSMContext):
         pid = product.id
     await sync_product_post(cb.bot, pid)
     await cb.message.answer("✅ تغییر ذخیره شد.")
+    await cb.answer()
+
+
+# ---------------- BRAND: MULTI-SELECT PRODUCTS ----------------
+
+BRAND_ASSIGN_LIMIT = 40
+
+
+async def brand_assign_markup(session, brand_id: int, result_ids, selected):
+    rows = []
+    for pid in result_ids:
+        p = await session.get(Product, pid)
+        if not p:
+            continue
+        if p.brand_id == brand_id:
+            mark = "✔️"
+        else:
+            mark = "✅" if pid in selected else "⭕"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {p.name[:45]} | {p.internal_sku}", callback_data=f"brandadd:t:{pid}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="☑️ انتخاب همه نتایج", callback_data="brandadd:all"),
+        InlineKeyboardButton(text="🔄 برداشتن همه", callback_data="brandadd:none"),
+    ])
+    rows.append([InlineKeyboardButton(text="🔎 جستجوی دیگر", callback_data="brandadd:more")])
+    rows.append([InlineKeyboardButton(text=f"💾 ثبت در برند ({fa_num(len(selected))} محصول)", callback_data="brandadd:save")])
+    rows.append([InlineKeyboardButton(text="❌ لغو", callback_data="brandadd:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("brandadd:start:"))
+@guard("products.edit")
+async def brand_assign_start(cb: CallbackQuery, state: FSMContext):
+    bid = int(cb.data.split(":")[2])
+    async with SessionLocal() as session:
+        brand = await session.get(Brand, bid)
+    if not brand:
+        return await cb.answer("برند پیدا نشد.", show_alert=True)
+    await state.clear()
+    await state.set_state(BrandAssign.search)
+    await state.update_data(assign_brand_id=bid, assign_selected=[], assign_results=[])
+    await cb.message.answer(
+        f"📦 افزودن محصول به برند «{brand.name}»\n\n"
+        "نام محصول (یا بخشی از آن، یا کد) را بفرستید. مثال: واشر\n"
+        "همه محصولات مشابه می‌آیند؛ روی هر کدام بزنید تا تیک بخورد و در آخر «ثبت در برند» را بزنید.\n"
+        "می‌توانید چند بار جستجو کنید؛ انتخاب‌ها حفظ می‌شوند."
+    )
+    await cb.answer()
+
+
+@router.message(BrandAssign.search)
+async def brand_assign_search(message: Message, state: FSMContext):
+    q = (message.text or "").strip()
+    if not q:
+        return await message.answer("نام محصول را به‌صورت متن بفرستید.")
+    data = await state.get_data()
+    bid = data.get("assign_brand_id")
+    q_norm = normalize_digits(q)
+    async with SessionLocal() as session:
+        brand = await session.get(Brand, bid) if bid else None
+        if not brand:
+            await state.clear()
+            return await message.answer("برند پیدا نشد؛ دوباره از صفحه برندها شروع کنید.")
+        total = await session.scalar(select(func.count(Product.id)).where(
+            (Product.name.ilike(f"%{q}%")) | (Product.internal_sku.ilike(f"%{q_norm}%"))
+        ))
+        products = (await session.execute(select(Product).where(
+            (Product.name.ilike(f"%{q}%")) | (Product.internal_sku.ilike(f"%{q_norm}%"))
+        ).order_by(Product.name, Product.id).limit(BRAND_ASSIGN_LIMIT))).scalars().all()
+        if not products:
+            return await message.answer("محصولی با این نام پیدا نشد؛ عبارت دیگری بفرستید.")
+        ids = [p.id for p in products]
+        selected = set(data.get("assign_selected") or [])
+        markup = await brand_assign_markup(session, bid, ids, selected)
+        brand_name = brand.name
+    await state.update_data(assign_results=ids)
+    extra = ""
+    if total and total > len(ids):
+        extra = f"\n⚠️ {fa_num(total)} نتیجه پیدا شد؛ فقط {fa_num(len(ids))} مورد اول نمایش داده شد. عبارت دقیق‌تری بفرستید."
+    await message.answer(
+        f"نتایج «{q}» برای برند «{brand_name}»: {fa_num(len(ids))} مورد{extra}\n\n"
+        "⭕ انتخاب‌نشده | ✅ انتخاب‌شده | ✔️ از قبل در همین برند",
+        reply_markup=markup,
+    )
+
+
+async def _brand_assign_refresh(cb: CallbackQuery, state: FSMContext, selected: set[int]):
+    await state.update_data(assign_selected=sorted(selected))
+    data = await state.get_data()
+    async with SessionLocal() as session:
+        markup = await brand_assign_markup(
+            session, data.get("assign_brand_id"), data.get("assign_results") or [], selected
+        )
+    try:
+        await cb.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        pass
+
+
+@router.callback_query(BrandAssign.search, F.data.startswith("brandadd:t:"))
+@guard("products.edit")
+async def brand_assign_toggle(cb: CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[2])
+    data = await state.get_data()
+    async with SessionLocal() as session:
+        p = await session.get(Product, pid)
+    if not p:
+        return await cb.answer("محصول پیدا نشد.", show_alert=True)
+    if p.brand_id == data.get("assign_brand_id"):
+        return await cb.answer("این محصول از قبل در همین برند است.")
+    selected = set(data.get("assign_selected") or [])
+    selected.symmetric_difference_update({pid})
+    await _brand_assign_refresh(cb, state, selected)
+    await cb.answer(f"{fa_num(len(selected))} محصول انتخاب شده")
+
+
+@router.callback_query(BrandAssign.search, F.data.in_({"brandadd:all", "brandadd:none"}))
+@guard("products.edit")
+async def brand_assign_bulk(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    bid = data.get("assign_brand_id")
+    selected = set(data.get("assign_selected") or [])
+    results = list(data.get("assign_results") or [])
+    if cb.data == "brandadd:all":
+        async with SessionLocal() as session:
+            for pid in results:
+                p = await session.get(Product, pid)
+                if p and p.brand_id != bid:
+                    selected.add(pid)
+    else:
+        selected -= set(results)
+    await _brand_assign_refresh(cb, state, selected)
+    await cb.answer(f"{fa_num(len(selected))} محصول انتخاب شده")
+
+
+@router.callback_query(BrandAssign.search, F.data == "brandadd:more")
+@guard("products.edit")
+async def brand_assign_more(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("عبارت بعدی را بفرستید؛ انتخاب‌های قبلی حفظ می‌شوند.")
+    await cb.answer()
+
+
+@router.callback_query(BrandAssign.search, F.data == "brandadd:cancel")
+@guard("products.edit")
+async def brand_assign_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.answer("افزودن محصول به برند لغو شد.")
+    await cb.answer()
+
+
+@router.callback_query(BrandAssign.search, F.data == "brandadd:save")
+@guard("products.edit")
+async def brand_assign_save(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    bid = data.get("assign_brand_id")
+    ids = sorted(set(data.get("assign_selected") or []))
+    if not ids:
+        return await cb.answer("حداقل یک محصول را تیک بزنید.", show_alert=True)
+    async with SessionLocal() as session:
+        brand = await session.get(Brand, bid) if bid else None
+        if not brand:
+            await state.clear()
+            return await cb.answer("برند پیدا نشد.", show_alert=True)
+        actor = await session.scalar(select(User).where(User.telegram_id == cb.from_user.id))
+        products = (await session.execute(select(Product).where(Product.id.in_(ids)))).scalars().all()
+        changed = []
+        for p in products:
+            if p.brand_id != bid:
+                changed.append({"id": p.id, "old_brand_id": p.brand_id})
+                p.brand_id = bid
+        await add_audit(session, actor.id if actor else None, "brand.assign_products", "brand", bid, {
+            "products": changed,
+        })
+        await session.commit()
+        brand_name = brand.name
+        posted = set((await session.execute(
+            select(ProductChannelPost.product_id).where(ProductChannelPost.product_id.in_([c["id"] for c in changed]))
+        )).scalars().all()) if changed else set()
+    await state.clear()
+    for pid in sorted(posted):
+        try:
+            await sync_product_post(cb.bot, pid)
+        except Exception:  # noqa: BLE001
+            pass
+    await cb.message.answer(
+        f"✅ {fa_num(len(changed))} محصول به برند «{brand_name}» منتقل شد."
+        + (f"\n📣 {fa_num(len(posted))} پست کانال هم به‌روزرسانی شد." if posted else ""),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 افزودن محصولات بیشتر", callback_data=f"brandadd:start:{bid}")],
+            [InlineKeyboardButton(text="⬅️ برندها", callback_data="admin:brands")],
+        ]),
+    )
     await cb.answer()

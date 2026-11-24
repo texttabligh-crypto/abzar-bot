@@ -41,6 +41,10 @@ END $$""",
     # --- V2.4: category/product helpers ---
     "CREATE INDEX IF NOT EXISTS ix_categories_parent_id ON categories (parent_id)",
     "CREATE INDEX IF NOT EXISTS ix_products_category_id ON products (category_id)",
+    # --- V2.5: channel buy button + single-decision receipts ---
+    "ALTER TABLE product_channel_posts ADD COLUMN IF NOT EXISTS button_message_id BIGINT",
+    "ALTER TABLE product_channel_posts ADD COLUMN IF NOT EXISTS album_size INTEGER",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS review_messages JSON",
 ]
 
 async def run_safe_migrations():
